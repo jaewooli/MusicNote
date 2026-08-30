@@ -49,9 +49,15 @@ def health() -> dict:
 
 
 def transcribe(wav_path: str, model: str | None = None,
-               timeout: int = DEFAULT_TIMEOUT) -> dict:
-    """POST to the worker. Returns {notes:[...], tracks:[...], model, seconds}."""
+               timeout: int = DEFAULT_TIMEOUT, shift: float = 0.0) -> dict:
+    """POST to the worker. Returns {notes:[...], tracks:[...], model, seconds}.
+
+    ``shift`` runs inference with that many seconds of silent lead-in; see
+    ``mt3_worker.transcribe``. Times come back on the original timeline.
+    """
     payload = {"wav_path": str(wav_path)}
+    if shift:
+        payload["shift"] = float(shift)
     m = model or DEFAULT_MODEL
     if m:
         payload["model"] = m

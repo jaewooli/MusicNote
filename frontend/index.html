@@ -209,7 +209,14 @@ function render(d, fromRefine) {
     ...(d.validation ? [['성부 검증', d.validation.structural.passed
       ? `${d.validation.structural.sequence_count ?? d.validation.structural.voice_count}개 시퀀스 · 화음 겹침 허용 ✓`
       : `시퀀스 검증 필요 ⚠`],
-      ['음향 누락 후보', `${(d.validation.missed_onset_candidates || []).length}개 · 2차 확인 ${(d.validation.confirmed_missing_notes || []).length}개 — 자동 추가하지 않고 검토용`]] : []),
+      ['검토 후보', (() => {
+        const c = d.validation.confirmed_missing_notes || [];
+        if (d.validation.candidate_source !== 'mt3-ensemble')
+          return `${c.length}개 — 자동 추가하지 않고 검토용`;
+        if (d.validation.ensemble_runs < 2) return '2차 채보 미실행';
+        const add = c.filter(n => !n.in_score).length;
+        return `${c.length}개 (악보에 있음 ${c.length - add} · 추가 후보 ${add}) — MT3 2회 채보가 불일치한 지점, 자동 반영 안 함`;
+      })()]] : []),
     ...(d.low_conf ? [['낮은 신뢰 음', `${d.low_conf}개 — 표·롤·악보에서 표시`]] : []),
   ].map(([k, v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
 

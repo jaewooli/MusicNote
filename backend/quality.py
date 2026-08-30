@@ -1,9 +1,27 @@
 """Post-transcription quality checks.
 
 These checks never alter a transcription. They make structural failures and
-acoustically plausible missed onsets visible to the caller for review.
+likely missed notes visible to the caller for review.
+
+MEASURED 2026-08-30 (eval/eval_validator.py, eval/refs):
+The CQT heuristic below scored precision 0.000 and recall 0.000 — of 20 reported
+candidates across two clips, none corresponded to a real omission, and it found
+none of the 162 true misses. Two structural reasons: it only scans MIDI 40-84,
+which excludes 44 % of actual misses, and it repeatedly fires on resonances at a
+single pitch. Its second-pass confirmation also ran a whole extra piano model
+(piano-tx, itself note F1 0.560 vs MT3's 0.865) inside the request path.
+
+It is therefore disabled by default. Omission candidates now come from
+disagreement between two MT3 runs at different segment offsets
+(`backend/mt3_ensemble.py`), which is produced by the same model on the same
+audio and so carries no independent false-positive mode.
 """
 from __future__ import annotations
+
+import os
+
+# Opt-in only; kept so the replaced approach stays measurable rather than lost.
+CQT_CANDIDATES = os.environ.get("MUSICNOTE_CQT_CANDIDATES", "0") == "1"
 
 
 def _overlaps(notes: list[dict]) -> int:
@@ -115,12 +133,38 @@ def confirm_candidates_with_second_pass(path: str, candidates: list[dict]) -> li
     return confirmed
 
 
-def audit(path: str, stems: list[dict], notes: list[dict]) -> dict:
+def _as_candidate(note: dict) -> dict:
+    """Shape an ensemble note the way the piano roll already expects.
+
+    ``in_score`` distinguishes "already drawn, but only one run saw it — verify"
+    from "withheld — approve to add".
+    """
+    return {"start": round(float(note["start"]), 3),
+            "end": round(float(note["end"]), 3),
+            "pitch": int(note["pitch"]),
+            "agreement": int(note.get("agreement", 1)),
+            "in_score": bool(note.get("in_score", False)),
+            "confirmed_by": "mt3-ensemble"}
+
+
+def audit(path: str, stems: list[dict], notes: list[dict],
+          ensemble_candidates: list[dict] | None = None,
+          runs: int = 1) -> dict:
+    """Structural summary plus a review queue of likely omissions.
+
+    ``ensemble_candidates`` are notes that only some MT3 runs found. They are
+    never inserted into the delivered score; the UI draws them for approval.
+    """
     structural = structural_report(stems)
-    # Keep a wider internal review pool. The UI draws only second-pass
-    # confirmations, so this does not turn into an automatic note flood.
-    missed = missing_onset_candidates(path, notes, limit=40)
-    confirmed = confirm_candidates_with_second_pass(path, missed)
+    missed: list[dict] = []
+    if CQT_CANDIDATES:
+        missed = missing_onset_candidates(path, notes, limit=40)
+        confirmed = confirm_candidates_with_second_pass(path, missed)
+    else:
+        confirmed = [_as_candidate(n) for n in (ensemble_candidates or [])]
+        confirmed.sort(key=lambda c: c["start"])
     return {"structural": structural, "missed_onset_candidates": missed,
             "confirmed_missing_notes": confirmed,
+            "candidate_source": "cqt" if CQT_CANDIDATES else "mt3-ensemble",
+            "ensemble_runs": int(runs),
             "status": "pass" if structural["passed"] else "fail"}

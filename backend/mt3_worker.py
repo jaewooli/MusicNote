@@ -4,7 +4,8 @@ MT3 transcription worker — runs in its OWN venv (~/mt3-venv, PyTorch-only) as 
 pm2 app, so the mt3-infer dependency tree never touches the main MusicNote venv.
 
   GET  /health           -> {ok, model, loaded, models}
-  POST /transcribe       body {"wav_path": "...", "model": "mr_mt3"|"yourmt3"|...}
+  POST /transcribe       body {"wav_path": "...", "model": "mr_mt3"|"yourmt3"|...,
+                                "shift": 0.0}   # seconds of silent lead-in
                          -> {ok, notes:[{start,end,pitch,velocity,program,is_drum,track}],
                              tracks:[{track,program,is_drum,count}], model, seconds}
 
@@ -97,7 +98,16 @@ def _to_pretty_midi(result):
         return pretty_midi.PrettyMIDI(f.name)
 
 
-def transcribe(wav_path: str, model_name: str) -> dict:
+def transcribe(wav_path: str, model_name: str, shift: float = 0.0) -> dict:
+    """Transcribe one file.
+
+    ``shift`` prepends that many seconds of silence before inference and
+    subtracts it from the emitted times. YourMT3 consumes non-overlapping
+    2.048 s segments (``input_frames`` = 32767 at 16 kHz), so an attack landing
+    on a segment boundary can be lost. Re-running with a half-segment shift
+    (1.024 s) puts those boundaries at a segment centre, and comparing the two
+    runs locates real omissions far more reliably than a spectral heuristic.
+    """
     y, sr = sf.read(wav_path)
     if getattr(y, "ndim", 1) > 1:
         y = y.mean(axis=1)
@@ -112,6 +122,9 @@ def transcribe(wav_path: str, model_name: str) -> dict:
     # room to close that event; emitted times are clamped back to source length.
     if END_PADDING_SECONDS > 0:
         y = np.pad(y, (0, int(round(END_PADDING_SECONDS * sr))))
+    shift = max(0.0, float(shift))
+    if shift > 0:
+        y = np.pad(y, (int(round(shift * sr)), 0))
 
     model = _get_model(model_name)
     t0 = time.time()
@@ -129,8 +142,12 @@ def transcribe(wav_path: str, model_name: str) -> dict:
         drum = bool(inst.is_drum)
         cnt = 0
         for n in inst.notes:
-            start = float(n.start)
-            end = min(float(n.end), dur)
+            # Undo the analysis-time shift before clamping to the source length.
+            start = float(n.start) - shift
+            end = min(float(n.end) - shift, dur)
+            if start < -0.05:
+                continue          # inside the silent lead-in: not a real event
+            start = max(start, 0.0)
             if start >= dur or end <= start:
                 continue
             notes.append({
@@ -145,7 +162,7 @@ def transcribe(wav_path: str, model_name: str) -> dict:
             cnt += 1
         tracks.append({"track": ti, "program": prog, "is_drum": drum, "count": cnt})
     notes.sort(key=lambda n: (n["start"], n["track"], n["pitch"]))
-    return {"ok": True, "notes": notes, "tracks": tracks,
+    return {"ok": True, "notes": notes, "tracks": tracks, "shift": round(shift, 4),
             "model": model_name, "seconds": round(took, 1), "duration": round(dur, 2)}
 
 
@@ -183,7 +200,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, {"ok": False, "error": f"no such file: {wav}"})
                 return
             with _inference_lock:
-                out = transcribe(wav, name)
+                out = transcribe(wav, name, float(req.get("shift", 0.0)))
             self._send(200, out)
         except Exception as e:  # noqa: BLE001
             self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}",

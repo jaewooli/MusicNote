@@ -11,6 +11,12 @@ Offline transcription accuracy check with mir_eval — so tuning stops being bli
 A reference dir holds pairs `<stem>.mid` (ground truth) + `<stem>.wav` (audio);
 build one with `eval/build_refs.py`.
 
+CAUTION: `direct:polyphonic` runs basic-pitch inside transcribe.py, but the
+product's own "polyphonic" mode is served by MT3 (see app.py `is_mt3`). So
+`direct:` is a fast proxy for the library, NOT for what a user receives. Use
+`api:` for shipped behaviour, or `eval/replay_eval.py` (cached MT3 output) when
+tuning post-processing, since MT3 here runs at roughly 25x realtime.
+
 Reported per clip and as a mean:
   * onset F1        — onset within 50 ms (did we find the note at all)
   * note F1         — onset 50 ms + pitch (the standard AMT number)

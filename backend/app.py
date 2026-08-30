@@ -26,6 +26,8 @@ from fastapi.staticfiles import StaticFiles
 
 import fetch
 import mt3_bridge as MT3
+import mt3_ensemble as ME
+import mt3_post as MP
 import musicxml as MX
 import quality as Q
 import stems as S
@@ -68,6 +70,15 @@ _STEMS_SLOT = threading.Semaphore(1)   # Demucs is heavy: one at a time
 # MT3 and Demucs both peak RAM hard — an MT3 job also holds _STEMS_SLOT so they
 # can never run together on this box.
 _MT3_SLOT = threading.Semaphore(1)
+
+# Seconds of silent lead-in for the second MT3 pass. YourMT3's segment is
+# 2.048 s, so a half segment (1.024) moves every boundary to a segment centre.
+# 0 disables the second pass and with it the omission review queue.
+ENSEMBLE_SHIFT = float(os.environ.get("MUSICNOTE_MT3_ENSEMBLE_SHIFT", "1.024"))
+# Runs a note must appear in to be delivered. 1 = union (keep everything, review
+# only the disagreements); 2 = vote (higher precision, notes seen once become
+# review candidates instead of being delivered).
+MIN_AGREEMENT = int(os.environ.get("MUSICNOTE_MT3_MIN_AGREEMENT", "1"))
 
 
 def _cleanup() -> None:
@@ -374,12 +385,11 @@ def _mt3_stems(job_id: str, raw: list[dict], sensitivity: float,
     register history. They are not claimed to be separate performers.
     """
     s = max(0.0, min(1.0, sensitivity))
-    amp_thr = int(round(18 * (1.0 - s)))          # velocity floor
-    min_len = 0.05 + 0.06 * (1.0 - s)             # seconds
+    kept, gate_report = MP.gate(raw, s)
+    if gate_report["dropped_length"] or gate_report["dropped_velocity"]:
+        print(f"mt3 gate: {gate_report}", flush=True)
     by_track: dict[int, dict] = {}
-    for n in raw:
-        if n["velocity"] < amp_thr or (n["end"] - n["start"]) < min_len:
-            continue
+    for n in kept:
         t = n["track"]
         d = by_track.setdefault(t, {"program": n["program"], "is_drum": n["is_drum"], "notes": []})
         p = int(n["pitch"])
@@ -469,14 +479,38 @@ def _mt3_pipeline(job_id: str, src_path: Path, audio_dur: float,
     if not _STEMS_SLOT.acquire(timeout=15) or not _MT3_SLOT.acquire(timeout=15):
         raise RuntimeError("다른 정밀 채보/분리 작업이 진행 중입니다. 잠시 후 다시 시도하세요.")
     try:
+        runs_wanted = 2 if ENSEMBLE_SHIFT > 0 else 1
         _phase(dl_steps + 1, "mt3",
-               "MT3 다악기 정밀 채보 중… (2-CPU 서버라 곡 길이의 약 8배 소요)",
-               max(30.0, audio_dur * 8.0))
+               f"MT3 다악기 정밀 채보 중… (2-CPU 서버라 곡 길이의 약 {8 * runs_wanted}배 소요)",
+               max(30.0, audio_dur * 8.0 * runs_wanted))
         out = MT3.transcribe(str(src_path))
         raw = out.get("notes", [])
         if not raw:
             raise RuntimeError("MT3 가 음을 찾지 못했습니다.")
+
+        # Second pass at a half-segment offset. YourMT3 reads non-overlapping
+        # 2.048 s segments, so an attack on a boundary can be dropped; where the
+        # two runs disagree is where the model is unreliable. A failure here
+        # must not lose the transcription we already have.
+        runs = [raw]
+        if ENSEMBLE_SHIFT > 0:
+            _phase(dl_steps + 1, "mt3",
+                   "누락 검증용 2차 채보 중… (세그먼트 경계를 옮겨 재추론)",
+                   max(30.0, audio_dur * 8.0))
+            try:
+                shifted = MT3.transcribe(str(src_path), shift=ENSEMBLE_SHIFT)
+                if shifted.get("notes"):
+                    runs.append(shifted["notes"])
+            except Exception as e:  # noqa: BLE001
+                print(f"mt3 ensemble pass failed, using single run: {e}", flush=True)
+
+        merged = ME.merge(runs)
+        raw, review = ME.split(merged, len(runs), MIN_AGREEMENT)
+        if len(runs) > 1:
+            print(f"mt3 ensemble: runs={len(runs)} merged={len(merged)} "
+                  f"accepted={len(raw)} review={len(review)}", flush=True)
         JOBS.get(job_id, {})["mt3_raw"] = raw
+        JOBS.get(job_id, {})["mt3_review"] = review
         JOBS.get(job_id, {})["mt3_model"] = out.get("model", "mr_mt3")
         try:
             import librosa
@@ -494,7 +528,8 @@ def _mt3_pipeline(job_id: str, src_path: Path, audio_dur: float,
                                out.get("model", "mr_mt3"), tempo, beats)
         # Validation is advisory: it surfaces likely misses but never invents
         # notes in the delivered score without a user review.
-        result["validation"] = Q.audit(str(src_path), stems_out, result["notes"])
+        result["validation"] = Q.audit(str(src_path), stems_out, result["notes"],
+                                       ensemble_candidates=review, runs=len(runs))
         return result
     finally:
         _MT3_SLOT.release()

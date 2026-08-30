@@ -7,3 +7,6 @@ uploads/
 .DS_Store
 backend/cookies.txt
 cookies.txt
+
+# cached MT3 raw output for eval/replay_eval.py (regenerate with eval/mt3_cache.py)
+eval/refs/*.mt3*.json
