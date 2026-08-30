@@ -10,3 +10,6 @@ cookies.txt
 
 # cached MT3 raw output for eval/replay_eval.py (regenerate with eval/mt3_cache.py)
 eval/refs/*.mt3*.json
+
+# staged by deploy/vast/build.sh, never committed (700 MB of model weights)
+deploy/vast/checkpoints/
