@@ -42,3 +42,27 @@ check("bass_plus_chord",
 # A legato melody survives a short MT3 offset overrun as one contour.
 check("offset_jitter_melody",
       [(0, (72,)), (.20, (74,)), (.40, (76,)), (.60, (77,))], [4])
+
+# Merging is transitive, so pairwise agreement is not enough. Three lines an
+# octave apart pass A-B and B-C but A-C is rejected as too far apart; single
+# linkage used to chain them into one 28-semitone "chord".
+check("no_chain_merge_across_two_octaves",
+      [(0, (48, 60, 72)), (.5, (50, 62, 74)), (1, (52, 64, 76))], [3, 6])
+
+
+def check_span(label, events, limit):
+    """No inferred chordal sequence may exceed the octave rule it claims."""
+    for part in separate_sequences(_notes(events)):
+        by_onset = {}
+        for n in part:
+            by_onset.setdefault(round(float(n["start"]), 3), []).append(int(n["pitch"]))
+        for t, pitches in by_onset.items():
+            span = max(pitches) - min(pitches)
+            assert span <= limit, (label, f"t={t}", f"span={span}", pitches)
+    print(f"{label}: every simultaneous group within {limit} semitones")
+
+
+# The vertical span of one sequence is the invariant the module documents;
+# check it directly rather than only through group sizes.
+check_span("chord_span_within_octave",
+           [(0, (48, 60, 72)), (.5, (50, 62, 74)), (1, (52, 64, 76))], 12)

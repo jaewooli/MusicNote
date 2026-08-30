@@ -145,24 +145,42 @@ def _aligned_pairs(a: list[dict], b: list[dict], tolerance: float) -> list[tuple
     return pairs
 
 
-def _parallel_chord_score(a: list[dict], b: list[dict], tolerance: float) -> float | None:
-    """Return a merge score when two lines behave as one chordal pattern.
+def _chord_verdict(a: list[dict], b: list[dict],
+                   tolerance: float) -> tuple[float | None, bool]:
+    """Judge whether two lines behave as one chordal pattern.
+
+    Returns ``(score, conflict)``. These are three outcomes, not two:
+
+    * ``(score, False)``  the pair is chordal; lower score is a better merge.
+    * ``(None, True)``    enough shared attacks to judge, and they failed on
+      register or interval — the pair must never share a sequence.
+    * ``(None, False)``   too few shared attacks to have an opinion. This is an
+      abstention, not a veto: two contours covering different stretches of the
+      clip legitimately have little overlap to compare.
+
+    Collapsing the last two into one "no" is what makes a one-off colour tone
+    look like a rejected line.
 
     This is deliberately a *whole-sequence* test.  A vertical sonority alone
     never passes: the lines need repeated shared attacks and a stable interval.
     """
     pairs = _aligned_pairs(a, b, tolerance)
     if len(pairs) < 2 or len(pairs) / min(len(a), len(b)) < 0.72:
-        return None
+        return None, False
     intervals = [int(right["pitch"]) - int(left["pitch"]) for left, right in pairs]
     centre = sum(intervals) / len(intervals)
     spread = sum((x - centre) ** 2 for x in intervals) / len(intervals)
     # Notes more than an octave apart are normally separate registers (bass /
     # melody), even when their rhythm happens to coincide.
     if abs(centre) > 12 or spread > 1.25 ** 2:
-        return None
+        return None, True
     # Prefer the most stable interval and the most complete rhythmic alignment.
-    return spread + (1.0 - len(pairs) / min(len(a), len(b))) * 2.0
+    return spread + (1.0 - len(pairs) / min(len(a), len(b))) * 2.0, False
+
+
+def _parallel_chord_score(a: list[dict], b: list[dict], tolerance: float) -> float | None:
+    """Merge score for two lines, or None when they are not one chordal pattern."""
+    return _chord_verdict(a, b, tolerance)[0]
 
 
 def separate_sequences(notes: list[dict], chord_gap: float = 0.035,
@@ -201,13 +219,32 @@ def separate_sequences(notes: list[dict], chord_gap: float = 0.035,
             parent[rb] = ra
 
     proposals = []
+    conflicts: set[tuple[int, int]] = set()
     for i in range(len(atoms)):
         for j in range(i + 1, len(atoms)):
-            score = _parallel_chord_score(atoms[i], atoms[j], chord_gap + 0.02)
+            score, conflict = _chord_verdict(atoms[i], atoms[j], chord_gap + 0.02)
             if score is not None:
                 proposals.append((score, i, j))
+            if conflict:
+                conflicts.add((i, j))
+
+    # Merging is transitive, so a pairwise test alone is not enough: single
+    # linkage merged A-B and B-C into one group even when A-C had been rejected,
+    # letting a "chord" exceed the octave limit _chord_verdict enforces on each
+    # pair — three lines an octave apart collapsed into one 28-semitone
+    # sequence. A join is now blocked when any cross pair actively conflicts.
+    # Pairs that merely lack shared attacks do not block it.
+    members: dict[int, list[int]] = {i: [i] for i in range(len(atoms))}
     for _score, i, j in sorted(proposals):
+        ri, rj = find(i), find(j)
+        if ri == rj:
+            continue
+        if any((min(a, b), max(a, b)) in conflicts
+               for a in members[ri] for b in members[rj]):
+            continue
         join(i, j)
+        merged = members.pop(ri) + members.pop(rj)
+        members[find(i)] = merged
 
     groups: dict[int, list[dict]] = {}
     for i, atom in enumerate(atoms):
