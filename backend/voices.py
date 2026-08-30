@@ -57,97 +57,111 @@ def _finish_at(voice: dict, when: float, min_dur: float) -> None:
 
 
 
-def _onset_groups(notes: list[dict], chord_gap: float) -> list[list[dict]]:
-    groups: list[list[dict]] = []
-    for note in notes:
-        if not groups or float(note["start"]) - float(groups[-1][0]["start"]) > chord_gap:
-            groups.append([note])
-        else:
-            groups[-1].append(note)
-    return groups
+def _aligned_pairs(a: list[dict], b: list[dict], tolerance: float) -> list[tuple[dict, dict]]:
+    """One-to-one onset alignment of two provisional melodic lines."""
+    pairs, j = [], 0
+    for left in a:
+        while j < len(b) and float(b[j]["start"]) < float(left["start"]) - tolerance:
+            j += 1
+        candidates = [k for k in (j - 1, j) if 0 <= k < len(b)
+                      and abs(float(b[k]["start"]) - float(left["start"])) <= tolerance]
+        if candidates:
+            k = min(candidates, key=lambda x: abs(float(b[x]["start"]) - float(left["start"])))
+            pairs.append((left, b[k]))
+            j = k + 1
+    return pairs
 
 
-def _shape_cost(previous: list[int], current: list[int], gap: float) -> float:
-    """Chord/contour transition score; lower means one continuing sequence."""
-    a, b = sorted(previous), sorted(current)
-    if len(a) != len(b):
-        return float("inf")
-    ac, bc = median(a), median(b)
-    # The interval shape identifies a chordal accompaniment even when it moves
-    # in parallel; the centre identifies its register.
-    shape = sum(abs((x - ac) - (y - bc)) for x, y in zip(a, b)) / len(a)
-    centre = abs(ac - bc)
-    return shape * 1.5 + centre * 0.42 + min(gap, 2.0) * 0.7
+def _parallel_chord_score(a: list[dict], b: list[dict], tolerance: float) -> float | None:
+    """Return a merge score when two lines behave as one chordal pattern.
+
+    This is deliberately a *whole-sequence* test.  A vertical sonority alone
+    never passes: the lines need repeated shared attacks and a stable interval.
+    """
+    pairs = _aligned_pairs(a, b, tolerance)
+    if len(pairs) < 2 or len(pairs) / min(len(a), len(b)) < 0.72:
+        return None
+    intervals = [int(right["pitch"]) - int(left["pitch"]) for left, right in pairs]
+    centre = sum(intervals) / len(intervals)
+    spread = sum((x - centre) ** 2 for x in intervals) / len(intervals)
+    # Notes more than an octave apart are normally separate registers (bass /
+    # melody), even when their rhythm happens to coincide.
+    if abs(centre) > 12 or spread > 1.25 ** 2:
+        return None
+    # Prefer the most stable interval and the most complete rhythmic alignment.
+    return spread + (1.0 - len(pairs) / min(len(a), len(b))) * 2.0
 
 
 def separate_sequences(notes: list[dict], chord_gap: float = 0.035,
                        continuity_gap: float = 2.4) -> list[list[dict]]:
-    """Infer independent musical sequences, allowing chords inside a sequence.
+    """Infer musical sequences using global chord-pattern evidence.
 
-    This deliberately differs from :func:`separate_voices`: an onset cluster
-    starts as one vertical event (a possible chord), not one line per pitch.
-    At later clusters we match subsets to prior chord shapes and registers. A
-    separate sequence is introduced only when a subset keeps recurring as an
-    independent contour; otherwise simultaneous notes remain a chord in the
-    same sequence. This is an interpretation for readable parts, not source
-    separation or performer identification.
+    1. Build provisional monophonic contours (every note is retained).
+    2. Compare complete contours, not individual onset groups.
+    3. Merge contours only if they repeatedly attack together, stay in the
+       same register, and keep a near-constant vertical interval.  Such a
+       component is a chordal sequence.  Other contours remain independent.
+
+    A one-off extra tone has no sequence evidence, so it is absorbed into a
+    nearby chord rather than being advertised as a new part.
     """
     ns = sorted(({**n, "start": float(n["start"]), "end": float(n["end"])}
                  for n in notes if float(n["end"]) > float(n["start"])),
                 key=lambda n: (n["start"], n["pitch"]))
-    if not ns:
-        return []
+    if len(ns) < 2:
+        return [ns] if ns else []
 
-    lanes: list[dict] = []
-    for group in _onset_groups(ns, chord_gap):
-        group = sorted(group, key=lambda n: n["pitch"])
-        now = float(group[0]["start"])
-        remaining = set(range(len(group)))
-        proposals = []
-        for li, lane in enumerate(lanes):
-            gap = now - lane["last_start"]
-            if gap < -chord_gap or gap > continuity_gap:
-                continue
-            count = len(lane["last_pitches"])
-            if count > len(group) or count > 4:
-                continue
-            # Large chord subsets become ambiguous and expensive; their full
-            # shape is still considered when the onset cluster has that size.
-            from itertools import combinations
-            for idxs in combinations(range(len(group)), count):
-                pitches = [int(group[k]["pitch"]) for k in idxs]
-                cost = _shape_cost(lane["last_pitches"], pitches, gap)
-                # Chord shape and register must both be plausible. A singleton
-                # gets a slightly tighter bound so it cannot steal a chord tone.
-                limit = 4.8 + 0.75 * count + 0.55 * min(gap, 2.0)
-                if cost <= limit:
-                    proposals.append((cost, -count, li, idxs, pitches))
-        # Resolve the strongest continuations first. Disjoint subsets let a
-        # melody and an accompaniment chord continue at the same onset.
-        used_lanes = set()
-        for _cost, _size, li, idxs, pitches in sorted(proposals):
-            if li in used_lanes or not set(idxs) <= remaining:
-                continue
-            lane = lanes[li]
-            chosen = [group[k] for k in idxs]
-            lane["notes"].extend(chosen)
-            lane["last_pitches"] = pitches
-            lane["last_start"] = now
-            lane["centres"].append(float(median(pitches)))
-            remaining.difference_update(idxs)
-            used_lanes.add(li)
-        if remaining:
-            # No prior contour explains these notes. Keep the vertical event
-            # intact as one tentative chord; later events may establish an
-            # independent line alongside it.
-            chosen = [group[k] for k in sorted(remaining)]
-            pitches = [int(n["pitch"]) for n in chosen]
-            lanes.append({"notes": chosen, "last_pitches": pitches,
-                          "last_start": now, "centres": [float(median(pitches))]})
+    # This stage only supplies atomic contours.  The decision to call something
+    # a chord happens below with look-ahead across the complete clip.
+    atoms = separate_voices(ns, max_voices=None, chord_gap=chord_gap)
+    parent = list(range(len(atoms)))
 
-    parts = [lane["notes"] for lane in lanes if lane["notes"]]
-    for part in parts:
-        part.sort(key=lambda n: (n["start"], n["pitch"]))
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def join(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    proposals = []
+    for i in range(len(atoms)):
+        for j in range(i + 1, len(atoms)):
+            score = _parallel_chord_score(atoms[i], atoms[j], chord_gap + 0.02)
+            if score is not None:
+                proposals.append((score, i, j))
+    for _score, i, j in sorted(proposals):
+        join(i, j)
+
+    groups: dict[int, list[dict]] = {}
+    for i, atom in enumerate(atoms):
+        groups.setdefault(find(i), []).extend(atom)
+
+    # An isolated, simultaneous colour note is a chord extension unless it has
+    # enough repeated events to establish its own rhythmic sequence.
+    stable = {root for root, group in groups.items()
+              if len({round(float(n["start"]), 3) for n in group}) >= 2}
+    for root in list(groups):
+        if root in stable:
+            continue
+        transient = groups[root]
+        candidates = []
+        for other in stable:
+            for n in transient:
+                for m in groups[other]:
+                    if (abs(float(n["start"]) - float(m["start"])) <= chord_gap + 0.02
+                            and abs(int(n["pitch"]) - int(m["pitch"])) <= 12):
+                        candidates.append((abs(int(n["pitch"]) - int(m["pitch"])), other))
+        if candidates:
+            target = min(candidates)[1]
+            groups[target].extend(transient)
+            del groups[root]
+
+    parts = [sorted(group, key=lambda n: (n["start"], n["pitch"]))
+             for group in groups.values() if group]
     parts.sort(key=lambda part: -median(n["pitch"] for n in part))
     return parts
 
