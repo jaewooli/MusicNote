@@ -4,7 +4,9 @@ Client for the MT3 transcription worker (backend/mt3_worker.py, pm2 app
 main MusicNote process.
 
 `available()` — is the worker up?
-`transcribe(wav_path, model=None, timeout=...)` — returns the worker's note list.
+`transcribe(wav_path, model=None, timeout=..., shift=0.0)` — returns the worker's
+note list, from the local worker or a vast.ai serverless endpoint depending on
+``MUSICNOTE_MT3_BACKEND``.
 `map_family(program, is_drum)` — GM program -> MuseScore-ish instrument family.
 """
 from __future__ import annotations
@@ -16,6 +18,16 @@ import urllib.error
 import urllib.request
 
 MT3_URL = os.environ.get("MUSICNOTE_MT3_URL", "http://127.0.0.1:8732").rstrip("/")
+# "local"  -> same-host pm2 worker, audio passed by path (no copy).
+# "vast"   -> vast.ai serverless endpoint via the vastai SDK, audio uploaded.
+BACKEND = os.environ.get("MUSICNOTE_MT3_BACKEND", "local")
+VAST_ENDPOINT = os.environ.get("MUSICNOTE_VAST_ENDPOINT", "musicnote-mt3")
+# Fall back to the local worker when the remote one fails, so a GPU outage
+# degrades to "slow" instead of "broken".
+REMOTE_FALLBACK = os.environ.get("MUSICNOTE_MT3_REMOTE_FALLBACK", "1") == "1"
+# MT3 resamples to 16 kHz mono anyway, so sending the source file would waste
+# most of the upload. A 13 s clip goes from 2.4 MB to about 200 kB as FLAC.
+UPLOAD_SR = 16000
 # unset -> let the worker's own MT3_MODEL choose
 DEFAULT_MODEL = os.environ.get("MUSICNOTE_MT3_MODEL") or None
 # MT3 on this CPU box is minutes/song; be generous.
@@ -48,19 +60,86 @@ def health() -> dict:
     return _health_cache["info"]
 
 
-def transcribe(wav_path: str, model: str | None = None,
-               timeout: int = DEFAULT_TIMEOUT, shift: float = 0.0) -> dict:
-    """POST to the worker. Returns {notes:[...], tracks:[...], model, seconds}.
+def encode_audio(wav_path: str) -> tuple[str, str, float]:
+    """Downsample to 16 kHz mono FLAC and base64 it for a remote worker.
 
-    ``shift`` runs inference with that many seconds of silent lead-in; see
-    ``mt3_worker.transcribe``. Times come back on the original timeline.
+    Returns (base64, extension, seconds). The duration travels with the request
+    because the autoscaler prices work by it, and guessing it from the encoded
+    size would be wrong for a lossless codec.
     """
-    payload = {"wav_path": str(wav_path)}
+    import base64
+    import io
+
+    import librosa
+    import soundfile as sf
+    y, _ = librosa.load(str(wav_path), sr=UPLOAD_SR, mono=True)
+    buf = io.BytesIO()
+    sf.write(buf, y, UPLOAD_SR, format="FLAC")
+    return base64.b64encode(buf.getvalue()).decode("ascii"), ".flac", len(y) / UPLOAD_SR
+
+
+def _payload(wav_path: str, model: str | None, shift: float, upload: bool) -> dict:
+    payload: dict = {}
+    if upload:
+        (payload["audio_b64"], payload["audio_ext"],
+         payload["audio_seconds"]) = encode_audio(wav_path)
+    else:
+        payload["wav_path"] = str(wav_path)
     if shift:
         payload["shift"] = float(shift)
     m = model or DEFAULT_MODEL
     if m:
         payload["model"] = m
+    return payload
+
+
+def _transcribe_vast(wav_path: str, model: str | None, shift: float,
+                     timeout: int) -> dict:
+    """Send to a vast.ai serverless endpoint.
+
+    The SDK picks a worker and routes the request; scale-to-zero means the
+    first call after an idle period pays a cold start of several minutes.
+    """
+    import asyncio
+
+    from vastai import Serverless
+
+    payload = _payload(wav_path, model, shift, upload=True)
+
+    async def run() -> dict:
+        client = Serverless()
+        try:
+            endpoint = await client.get_endpoint(name=VAST_ENDPOINT)
+            # cost drives the autoscaler's load accounting; audio seconds is
+            # the honest unit since MT3 runtime scales with duration.
+            cost = max(1.0, float(payload["audio_seconds"]))
+            return await endpoint.request("/transcribe", payload, cost=cost)
+        finally:
+            await client.close()
+
+    out = asyncio.run(asyncio.wait_for(run(), timeout))
+    # The SDK wraps the worker's body; accept either shape.
+    return out.get("response", out) if isinstance(out, dict) else out
+
+
+def transcribe(wav_path: str, model: str | None = None,
+               timeout: int = DEFAULT_TIMEOUT, shift: float = 0.0) -> dict:
+    """Transcribe via the configured backend.
+
+    Returns {notes:[...], tracks:[...], model, seconds}. ``shift`` runs
+    inference with that many seconds of silent lead-in; see
+    ``mt3_worker.transcribe``. Times come back on the original timeline.
+    """
+    if BACKEND == "vast":
+        try:
+            return _transcribe_vast(wav_path, model, shift, timeout)
+        except Exception as e:  # noqa: BLE001
+            if not REMOTE_FALLBACK:
+                raise
+            print(f"mt3 remote backend failed ({type(e).__name__}: {e}); "
+                  f"falling back to the local worker", flush=True)
+
+    payload = _payload(wav_path, model, shift, upload=False)
     body = json.dumps(payload).encode()
     req = urllib.request.Request(MT3_URL + "/transcribe", data=body,
                                  headers={"Content-Type": "application/json"})

@@ -1,0 +1,4 @@
+# PyWorker side only. The model server's own deps live in the image.
+vastai
+numpy
+soundfile

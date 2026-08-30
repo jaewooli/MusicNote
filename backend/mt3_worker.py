@@ -4,8 +4,9 @@ MT3 transcription worker — runs in its OWN venv (~/mt3-venv, PyTorch-only) as 
 pm2 app, so the mt3-infer dependency tree never touches the main MusicNote venv.
 
   GET  /health           -> {ok, model, loaded, models}
-  POST /transcribe       body {"wav_path": "...", "model": "mr_mt3"|"yourmt3"|...,
-                                "shift": 0.0}   # seconds of silent lead-in
+  POST /transcribe       body {"model": ..., "shift": 0.0} plus ONE audio source:
+                           "wav_path"  local file (same-host worker), or
+                           "audio_b64" base64 of an audio file (remote worker)
                          -> {ok, notes:[{start,end,pitch,velocity,program,is_drum,track}],
                              tracks:[{track,program,is_drum,count}], model, seconds}
 
@@ -14,6 +15,7 @@ idle period, because YourMT3 peaks ~7.5 GB on CPU.
 
 Env:
   MT3_MODEL           default model name                 (default "mr_mt3")
+  MT3_DEVICE         torch device: cpu|cuda|auto        (default "cpu")
   MT3_PORT            listen port                        (default 8732)
   MT3_THREADS        torch intra-op threads             (default 2)
   MT3_IDLE_UNLOAD    seconds of idle before unload; 0=never (default 600)
@@ -35,9 +37,15 @@ import torch
 MODEL_NAME = os.environ.get("MT3_MODEL", "mr_mt3")
 PORT = int(os.environ.get("MT3_PORT", "8732"))
 THREADS = int(os.environ.get("MT3_THREADS", "2"))
+# "auto" lets mt3_infer pick CUDA when present. Kept at cpu by default so the
+# local pm2 worker never silently changes behaviour.
+DEVICE = os.environ.get("MT3_DEVICE", "cpu")
 IDLE_UNLOAD = float(os.environ.get("MT3_IDLE_UNLOAD", "600"))
 TARGET_SR = 16000
 END_PADDING_SECONDS = float(os.environ.get("MT3_END_PADDING_SECONDS", "0.75"))
+# Upload ceiling for a remote worker. 16 kHz mono is ~32 kB/s, so this is about
+# 25 minutes of audio — well past the app's own duration cap.
+MAX_AUDIO_BYTES = int(os.environ.get("MT3_MAX_AUDIO_BYTES", str(48 * 1024 * 1024)))
 
 torch.set_num_threads(max(1, THREADS))
 
@@ -60,7 +68,7 @@ def _get_model(name: str):
             _model_name = None
         if _model is None:
             from mt3_infer import load_model
-            _model = load_model(name, device="cpu")
+            _model = load_model(name, device=DEVICE)
             _model_name = name
         _last_use = time.time()
         return _model
@@ -182,7 +190,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.rstrip("/") == "/health":
-            self._send(200, {"ok": True, "model": MODEL_NAME,
+            self._send(200, {"ok": True, "model": MODEL_NAME, "device": DEVICE,
                              "loaded": _model_name, "models": ["mr_mt3", "mt3_pytorch", "yourmt3"]})
         else:
             self._send(404, {"ok": False, "error": "not found"})
@@ -191,27 +199,49 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.rstrip("/") != "/transcribe":
             self._send(404, {"ok": False, "error": "not found"})
             return
+        tmp = None
         try:
             n = int(self.headers.get("Content-Length", "0"))
             req = json.loads(self.rfile.read(n) or b"{}")
-            wav = req["wav_path"]
             name = req.get("model") or MODEL_NAME
-            if not os.path.exists(wav):
-                self._send(400, {"ok": False, "error": f"no such file: {wav}"})
-                return
+            # A remote worker has no access to the caller's filesystem, so the
+            # audio travels in the request. Local runs keep using a path so a
+            # same-host job does not copy megabytes through JSON.
+            if req.get("audio_b64"):
+                import base64
+                import tempfile
+                raw = base64.b64decode(req["audio_b64"])
+                if len(raw) > MAX_AUDIO_BYTES:
+                    self._send(413, {"ok": False, "error": "audio too large"})
+                    return
+                fd, tmp = tempfile.mkstemp(suffix=req.get("audio_ext", ".wav"))
+                with os.fdopen(fd, "wb") as f:
+                    f.write(raw)
+                wav = tmp
+            else:
+                wav = req.get("wav_path")
+                if not wav or not os.path.exists(wav):
+                    self._send(400, {"ok": False, "error": f"no such file: {wav}"})
+                    return
             with _inference_lock:
                 out = transcribe(wav, name, float(req.get("shift", 0.0)))
             self._send(200, out)
         except Exception as e:  # noqa: BLE001
             self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}",
                              "trace": traceback.format_exc()[-1500:]})
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
 
 def main():
     threading.Thread(target=_maybe_unload, daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"mt3_worker: listening on 127.0.0.1:{PORT}  default model={MODEL_NAME} "
-          f"threads={THREADS} idle_unload={IDLE_UNLOAD}s", flush=True)
+          f"device={DEVICE} threads={THREADS} idle_unload={IDLE_UNLOAD}s", flush=True)
     srv.serve_forever()
 
 
