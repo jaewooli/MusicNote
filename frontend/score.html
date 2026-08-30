@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MusicNote — 전체 악보</title>
+<link rel="stylesheet" href="style.css" />
+<style>
+  #scoreShell { max-width: none; padding: 0; }
+  #fsToolbar { position: sticky; top: 0; z-index: 10; background: var(--bg);
+    border-bottom: 1px solid var(--line); padding: 10px 16px; display: flex;
+    gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+  #fsToolbar .transport { flex: 1; min-width: 240px; margin: 0; }
+  #fullScore { background: #f7f7f4; margin: 0; padding: 16px; overflow-x: auto; }
+  #fullScore svg { display: block; }
+  #fsMsg { padding: 50px; text-align: center; color: var(--muted); }
+  @media print {
+    header, #fsToolbar { display: none !important; }
+    body { background: #fff; }
+    #fullScore { background: #fff; padding: 0; overflow: visible; }
+    #scoreHead { display: none !important; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎼 <a href="./">MusicNote</a> · 전체 악보</h1>
+  <span class="sub" id="fsTitle"></span>
+  <span class="subnav">
+    <a id="fsEdit" href="#">✏️ 편집</a>
+    <a href="#" id="fsBack">← 분석 결과</a>
+    <a href="#" onclick="print();return false">🖨 인쇄</a>
+  </span>
+</header>
+
+<main id="scoreShell">
+  <div id="fsToolbar" style="display:none">
+    <div class="transport">
+      <button class="ghost" id="ppBtn">▶</button>
+      <input type="range" id="seek" min="0" max="1000" step="1" value="0" />
+      <span class="hint" id="tpos">0:00 / 0:00</span>
+      <span class="hint" id="synthBusy"></span>
+    </div>
+    <label class="field">조표
+      <select id="keySel">
+        <option value="auto">자동</option>
+        <option>C</option><option>G</option><option>D</option><option>A</option>
+        <option>E</option><option>B</option><option>F</option>
+        <option>Bb</option><option>Eb</option><option>Ab</option>
+      </select>
+    </label>
+    <label class="field">박자표
+      <select id="tsSel"><option>4/4</option><option>3/4</option><option>2/4</option><option>6/8</option><option>3/8</option></select>
+    </label>
+    <label class="field">템포(BPM)
+      <input type="number" id="scoreTempo" min="30" max="300" step="1" value="120" style="width:80px" />
+    </label>
+    <span class="hint" id="fsParts">악기·성부(1st/2nd)별로 한 단씩 · 리듬 16분음표 격자 근사</span>
+  </div>
+  <div id="fsMsg">불러오는 중…</div>
+  <div id="fullScore" class="scoreBox" style="display:none">
+    <div id="scoreInner"><div id="scoreSvg"></div><div id="scoreHead" class="playhead" hidden></div></div>
+  </div>
+</main>
+
+<script src="vendor/vexflow.js"></script>
+<script src="musicnote-core.js"></script>
+<script>
+Editor.on = false;
+let RESULT = null;
+
+function parseKey(str) {
+  const m = (str || '').match(/^([A-G][#b]?)\s+(major|minor)$/i);
+  if (!m) return 'C';
+  let name = m[1];
+  if (m[2].toLowerCase() === 'minor') name = MINOR_TO_MAJOR[name] || 'C';
+  return KEYSIG[name] ? name : 'C';
+}
+function fsParts() {
+  const r = RESULT;
+  if (Array.isArray(r.stems) && r.stems.length) {
+    const ps = r.stems.filter(s => s.pitched && (s.notes || []).length)
+      .map(s => ({ label: s.label, notes: s.notes }));
+    if (ps.length) return ps;
+  }
+  return [{ label: '', notes: r.notes || [] }];
+}
+
+const KEY_FIFTHS = { C: 0, G: 1, D: 2, A: 3, E: 4, B: 5, F: -1, Bb: -2, Eb: -3, Ab: -4 };
+let drawSeq = 0;
+
+async function draw() {
+  if (!RESULT) return;
+  const seq = ++drawSeq;
+  const ks = $('#keySel').value;
+  const ts = ($('#tsSel').value || '4/4').split('/').map(Number);
+  const tempo = +$('#scoreTempo').value || RESULT.tempo || 120;
+  const p = { num: ts[0] || 4, den: ts[1] || 4, tempo };
+  if (ks !== 'auto') p.fifths = KEY_FIFTHS[ks] ?? 0;
+  try {
+    const doc = await fetchScoreDoc(RESULT.job_id, p);
+    if (seq !== drawSeq) return;
+    renderDoc($('#scoreSvg'), doc);
+    const nv = doc.parts.reduce((a, x) => a + x.voices.length, 0);
+    $('#fsParts').textContent =
+      `${doc.parts.length}개 파트 / ${nv}성부 · ${fifthsToKey(doc.key_fifths)} · `
+      + `${doc.time_sig[0]}/${doc.time_sig[1]} · 화음·셋잇단·붙임줄 표기`;
+  } catch (e) {
+    $('#scoreSvg').innerHTML =
+      '<p class="hint" style="padding:20px">악보 생성 실패: ' + e.message + '</p>';
+  }
+}
+
+['#keySel', '#tsSel'].forEach(s => $(s).addEventListener('change', draw));
+$('#scoreTempo').addEventListener('change', draw);
+let rz; window.addEventListener('resize', () => { clearTimeout(rz); rz = setTimeout(draw, 200); });
+window.addEventListener('keydown', e => {
+  if ((e.target.tagName || '').toLowerCase() === 'input') return;
+  if (e.key === ' ') { e.preventDefault(); Player.toggle(); }
+});
+
+(function init() {
+  const jid = new URLSearchParams(location.search).get('job');
+  if (!jid) { $('#fsMsg').textContent = '작업 ID가 없습니다.'; return; }
+  $('#fsBack').href = './#job=' + jid;
+  $('#fsEdit').href = 'editor.html?job=' + jid;
+  fetch('api/progress/' + jid).then(r => r.ok ? r.json() : Promise.reject(r.status)).then(p => {
+    if (p.status !== 'done') { $('#fsMsg').textContent = p.status === 'running' ? '아직 분석 중입니다.' : '만료된 작업입니다.'; return; }
+    RESULT = p.result;
+    $('#fsTitle').textContent = RESULT.filename || '';
+    $('#scoreTempo').value = Math.round(RESULT.tempo || 120);
+    $('#fsMsg').style.display = 'none';
+    $('#fsToolbar').style.display = 'flex';
+    $('#fullScore').style.display = '';
+    draw();
+    // play everything (all parts) together
+    const all = fsParts().flatMap(p => p.notes);
+    Player.setNotes(all, RESULT.duration || 0);
+  }).catch(() => { $('#fsMsg').textContent = '불러오기 실패.'; });
+})();
+</script>
+</body>
+</html>

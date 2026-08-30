@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+logs/
+uploads/
+*.mid
+.DS_Store
+backend/cookies.txt
+cookies.txt

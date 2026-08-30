@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MusicNote — 음원에서 음 따오기</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <h1>🎵 <a href="./">MusicNote</a></h1>
+  <span class="sub">음원 파일에서 멜로디와 각 음을 추출합니다 · 프로토타입</span>
+  <span class="pill" id="enginePill">엔진 확인 중…</span>
+</header>
+
+<main>
+  <div class="card">
+    <div class="tabs">
+      <button class="tab active" data-src="file">파일 업로드</button>
+      <button class="tab" data-src="url">YouTube 링크</button>
+    </div>
+
+    <div class="row" id="srcFile" style="margin-top:12px">
+      <label class="field">
+        오디오 파일
+        <input type="file" id="file" accept=".mp3,.wav,.flac,.ogg,.m4a,.aac,.opus,.webm,audio/*" />
+      </label>
+    </div>
+
+    <div class="row" id="srcUrl" style="margin-top:12px; display:none">
+      <label class="field" style="flex:1; min-width:280px">
+        YouTube URL
+        <input type="url" id="url" placeholder="https://www.youtube.com/watch?v=..." />
+        <span class="hint" id="ytNote"></span>
+      </label>
+    </div>
+
+    <div class="row" style="margin-top:12px">
+      <div class="field"><b>전체 악기 채보</b><span class="hint">원본에서 감지 가능한 모든 악기 트랙과 음표를 함께 채보합니다.</span></div>
+      <button class="primary" id="go">분석하기</button>
+      <button class="ghost" id="newJob" style="display:none">새 분석</button>
+    </div>
+    <div class="hint">
+      학습된 <b>MT3</b> 모델이 원본 오디오를 한 번에 악기별 트랙으로 채보합니다.
+      <b>이 서버(2-CPU)에서는 곡 길이의 약 8배 시간</b>이 걸립니다.
+      파일 업로드 최대 40&nbsp;MB · YouTube <span id="ytmax">20</span>분 이내.
+      분석 중 새로고침해도 진행 상태가 유지됩니다.
+    </div>
+    <div class="status" id="status"></div>
+    <div class="progress" id="progress" style="display:none">
+      <div class="plabel"><b id="pmsg">준비 중…</b><span id="ppct"></span></div>
+      <div class="bar"><div class="fill" id="pfill"></div></div>
+    </div>
+  </div>
+
+  <div id="results" style="display:none">
+    <div class="card" id="stemCard" style="display:none">
+      <h3 style="margin:0 0 4px">악기 스템</h3>
+      <div class="hint" style="margin-bottom:10px">분리한 악기군. 막대는 그 악기가 곡의 어느 구간에서
+        소리 나는지입니다. "이 선율 보기"로 아래 피아노 롤·표에 불러옵니다.</div>
+      <div id="stemList"></div>
+    </div>
+
+    <div class="card">
+      <div class="grid" id="stats"></div>
+      <div class="player" id="playerWrap" style="display:none">
+        <div class="k">원본 음원</div>
+        <audio id="audio" controls preload="none" playsinline></audio>
+      </div>
+      <div class="player" id="synthWrap" style="display:none">
+        <div class="k">추출 결과 재생 <span id="synthBusy" class="hint"></span></div>
+        <div class="transport">
+          <button class="ghost" id="ppBtn">▶</button>
+          <input type="range" id="seek" min="0" max="1000" step="1" value="0" />
+          <span class="hint" id="tpos">0:00 / 0:00</span>
+        </div>
+      </div>
+      <div class="refine" id="refineWrap" style="display:none">
+        <div class="k">
+          <span>악기 <b id="instHint"></b></span>
+          <span id="sensBusy" class="hint"></span>
+        </div>
+        <select id="inst" style="width:100%"></select>
+        <div class="k" style="margin-top:14px"><span>민감도 <b id="sensVal">50</b></span></div>
+        <input type="range" id="sens" min="0" max="100" step="1" value="50" />
+        <div class="ends"><span>낮음 · 확실한 음만</span><span>작은·짧은 음까지 · 높음</span></div>
+        <label class="k" style="margin-top:12px; display:flex; gap:8px; align-items:center; cursor:pointer">
+          <input type="checkbox" id="quant" /> 박자 정렬 (음 시작·길이를 비트 격자에 맞춤)
+          <span id="quantInfo" class="hint"></span>
+        </label>
+        <div class="k" id="voiceWrap" style="margin-top:12px; display:none; gap:10px; align-items:center; flex-wrap:wrap">
+          <label style="display:flex; gap:8px; align-items:center; cursor:pointer; margin:0">
+            <input type="checkbox" id="splitVoices" checked /> 성부 자동 분리
+          </label>
+          <span class="hint">동시음은 먼저 화음으로 유지하고, 전후 진행·반복·음역대가 독립적일 때만 별도 시퀀스로 분리합니다.</span>
+        </div>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <a class="ghost" id="midi" href="#" download>⬇ MIDI 다운로드</a>
+        <button class="ghost" id="json">⬇ JSON 다운로드</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin:0 0 10px">피아노 롤</h3>
+      <div id="pianoWrap"><div id="rollInner"><canvas id="roll" width="1000" height="420"></canvas><div id="rollHead" class="playhead" hidden></div></div></div>
+      <div class="hint">가로 = 시간, 세로 = 음높이. 주황 선 = 추출된 피치 곡선.
+        <span style="color:#ff8a8a">빨강 점선</span>·<span style="color:#ffcf6e">노랑 테두리</span> = 신뢰도 낮은 음.
+        음표 편집은 <b>악보 편집기</b>에서.</div>
+    </div>
+
+    <div class="card" id="scoreCard">
+      <div class="row" style="justify-content:space-between; align-items:center">
+        <h3 style="margin:0">🎼 악보 (미리보기)</h3>
+        <span class="row" style="gap:8px">
+          <a class="ghost" id="openFullScore" href="#" target="_blank" style="display:none">🖥 전체 악보(악기별)</a>
+          <a class="btnlink" id="openEditor" href="#" style="display:none">✏️ 악보·리듬 편집기 열기 →</a>
+        </span>
+      </div>
+      <div id="score" class="scoreBox" style="margin-top:10px">
+        <div id="scoreInner"><div id="scoreSvg"></div><div id="scoreHead" class="playhead" hidden></div></div>
+      </div>
+      <div class="hint">감지된 조성 · 4/4 · 추정 템포로 표시한 미리보기입니다. 조표·박자·리듬 조정과
+        음표 편집(끌기·그리기·삭제)은 <b>편집기</b>에서 하세요.
+        <span style="color:#c85f3b">주황빛 음표</span> = 신뢰도 낮음.</div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin:0 0 10px">음 목록 (<span id="ncount">0</span>)</h3>
+      <div class="tableScroll">
+        <table>
+          <thead><tr><th>#</th><th id="instTh" hidden>악기</th><th>음이름</th><th>MIDI</th><th>주파수(Hz)</th><th>시작(s)</th><th>길이(s)</th><th>세기</th><th id="confTh" hidden>신뢰</th></tr></thead>
+          <tbody id="tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script src="vendor/vexflow.js"></script>
+<script src="musicnote-core.js"></script>
+<script>
+let SRC = 'file';
+
+fetch('api/health').then(r => r.json()).then(h => {
+  $('#enginePill').textContent = h.mt3
+    ? `전체 악기: ${h.mt3_model || 'MT3'} 사용 가능`
+    : '전체 악기 채보 모델을 찾을 수 없음';
+  if (h.max_duration) $('#ytmax').textContent = Math.round(h.max_duration / 60);
+  $('#go').disabled = !h.mt3;
+  if (!h.mt3) setStatus('전체 악기 채보 모델(MT3)이 실행 중이지 않습니다.', 'err');
+  const pot = h.pot_server ? 'POT provider ✓' : 'POT provider ✗';
+  $('#ytNote').textContent = h.yt_cookies
+    ? `쿠키 설정됨 · ${pot} — 대부분의 영상 다운로드 가능.`
+    : `⚠ YouTube 쿠키 없음 (${pot}). 쿠키 없이는 현재 YouTube가 차단합니다. 파일 업로드는 항상 동작합니다.`;
+}).catch(() => $('#enginePill').textContent = '상태 확인 실패');
+
+document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
+  document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+  t.classList.add('active');
+  SRC = t.dataset.src;
+  $('#srcFile').style.display = SRC === 'file' ? '' : 'none';
+  $('#srcUrl').style.display = SRC === 'url' ? '' : 'none';
+}));
+
+$('#newJob').addEventListener('click', () => { MN.clearJob(); location.href = location.pathname; });
+
+$('#go').addEventListener('click', async () => {
+  const fd = new FormData();
+  fd.append('mode', 'polyphonic');
+  setStatus('전체 악기 채보는 이 서버에서 곡당 수 분 걸립니다. 새로고침해도 진행됩니다.', 'warn');
+  if (SRC === 'url') {
+    const u = $('#url').value.trim();
+    if (!u) { setStatus('YouTube URL을 입력하세요.', 'err'); return; }
+    fd.append('url', u);
+  } else {
+    const f = $('#file').files[0];
+    if (!f) { setStatus('파일을 선택하세요.', 'err'); return; }
+    fd.append('file', f);
+  }
+
+  $('#go').disabled = true;
+  TEMPO_TOUCHED = false;
+  setStatus('');
+  showProgress(0, SRC === 'url' ? '서버로 전송 중…' : '파일 업로드 중…', true);
+  try {
+    const r = await fetch('api/transcribe', { method: 'POST', body: fd });
+    const start = await r.json();
+    if (!r.ok) throw new Error(start.detail || ('HTTP ' + r.status));
+    MN.storeJob(start.job_id);
+    $('#newJob').style.display = '';
+    await pollJob(start.job_id);
+  } catch (e) {
+    hideProgress();
+    setStatus('오류: ' + e.message, 'err');
+  } finally {
+    $('#go').disabled = false;
+  }
+});
+
+// full render for the analysis page = stats + audio + refine block + shared bits
+function render(d, fromRefine) {
+  $('#results').style.display = 'block';
+  const mm = Math.floor(d.duration / 60), ss = (d.duration % 60).toFixed(1).padStart(4, '0');
+  $('#stats').innerHTML = [
+    ['파일', d.filename || '-'], ['엔진', d.engine], ['모드', d.mode],
+    ['길이', `${mm}:${ss}`], ['템포(추정)', d.tempo ? d.tempo + ' BPM' : '-'],
+    ['조성(추정)', d.key || '-'], ['추출된 음', d.note_count],
+    ...(d.validation ? [['성부 검증', d.validation.structural.passed
+      ? `${d.validation.structural.sequence_count ?? d.validation.structural.voice_count}개 시퀀스 · 화음 겹침 허용 ✓`
+      : `시퀀스 검증 필요 ⚠`],
+      ['음향 누락 후보', `${(d.validation.missed_onset_candidates || []).length}개 — 자동 추가하지 않고 검토용`]] : []),
+    ...(d.low_conf ? [['낮은 신뢰 음', `${d.low_conf}개 — 표·롤·악보에서 표시`]] : []),
+  ].map(([k, v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+
+  const au = $('#audio');
+  if (d.audio_url) {
+    const abs = new URL(d.audio_url, location.href).href;
+    if (au.src !== abs) au.src = d.audio_url;
+    $('#playerWrap').style.display = '';
+  } else if (!fromRefine) { au.removeAttribute('src'); au.load(); $('#playerWrap').style.display = 'none'; }
+
+  if (d.job_id) {
+    $('#refineWrap').style.display = '';
+    const inst = d.instrument || {};
+    const hasInst = Array.isArray(inst.options) && inst.options.length > 0;
+    $('#inst').hidden = !hasInst;
+    if (!fromRefine) {
+      if (typeof d.sensitivity === 'number') {
+        $('#sens').value = Math.round(d.sensitivity * 100);
+        $('#sensVal').textContent = $('#sens').value;
+      }
+      if (hasInst) {
+        $('#inst').innerHTML = inst.options.map(o => `<option value="${o.value}">${o.label}</option>`).join('');
+        $('#inst').value = inst.selected || 'auto';
+      }
+      $('#quant').checked = !!d.quantized;
+    }
+    $('#quantInfo').textContent = d.beat_count
+      ? `(비트 ${d.beat_count}개)` : (d.beat_count === 0 ? '(비트 감지 실패)' : '');
+    const isMt3 = (LAST && LAST.mode === 'mt3');
+    $('#voiceWrap').style.display = isMt3 ? 'flex' : 'none';
+    const presetKo = { struck: '타/발현형', sustained: '지속형', percussive: '타악형', neutral: '기본' };
+    $('#instHint').textContent = inst.detected_label
+      ? `— 감지: ${inst.detected_label} · 적용: ${presetKo[inst.preset] || inst.preset}`
+      : (ACTIVE_STEM ? '' : '— 모든 악기 합침 (스템별 조정은 위에서)');
+  } else {
+    $('#refineWrap').style.display = 'none';
+  }
+
+  renderCommon(d, fromRefine);
+}
+
+// --- live re-segment (sensitivity / instrument / quantize) -----------------
+let refineTimer = null, refineInFlight = false, refinePending = false;
+function curRefineArgs() {
+  const a = {
+    sensitivity: (+$('#sens').value) / 100,
+    instrument: $('#inst').value || 'auto',
+    quantize: $('#quant').checked,
+  };
+  if (LAST && LAST.mode === 'mt3') {
+    a.split_voices = $('#splitVoices').checked;
+  } else if (ACTIVE_STEM) a.stem = ACTIVE_STEM;
+  return a;
+}
+$('#sens').addEventListener('input', () => {
+  $('#sensVal').textContent = $('#sens').value;
+  clearTimeout(refineTimer);
+  refineTimer = setTimeout(queueRefine, 130);
+});
+$('#inst').addEventListener('change', () => { clearTimeout(refineTimer); queueRefine(); });
+$('#quant').addEventListener('change', () => { clearTimeout(refineTimer); queueRefine(); });
+$('#splitVoices').addEventListener('change', () => { clearTimeout(refineTimer); queueRefine(); });
+
+function queueRefine() {
+  if (!LAST || !LAST.job_id) return;
+  if (refineInFlight) { refinePending = true; return; }
+  refineInFlight = true;
+  $('#sensBusy').textContent = '조정 중…';
+  fetch('api/refine/' + LAST.job_id, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(curRefineArgs()),
+  }).then(async r => {
+    const res = await r.json();
+    if (!r.ok) throw new Error(res.detail || ('HTTP ' + r.status));
+    LAST = res;
+    const shown = (Array.isArray(res.stems) && res.stems.length)
+      ? (renderStems(res), ACTIVE_STEM ? stemView(res, ACTIVE_STEM) : res)
+      : res;
+    render(shown, true);
+    Editor.load(shown);
+  }).catch(e => {
+    setStatus('조정 실패: ' + e.message, 'warn');
+  }).finally(() => {
+    refineInFlight = false;
+    $('#sensBusy').textContent = '';
+    if (refinePending) { refinePending = false; queueRefine(); }
+  });
+}
+
+// --- resume a job on page load: NO re-analysis on refresh ------------------
+(function resume() {
+  const jid = MN.storedJobId();
+  if (!jid) return;
+  $('#newJob').style.display = '';
+  setStatus('이전 분석을 불러오는 중…');
+  fetch('api/progress/' + jid).then(r => r.ok ? r.json() : Promise.reject(r.status)).then(p => {
+    if (p.status === 'done') {
+      LAST = p.result;
+      showResult(p.result);
+      setStatus('이전 분석 결과입니다 (새로고침해도 유지). 다시 하려면 “새 분석”.', '');
+    } else if (p.status === 'running') {
+      $('#go').disabled = true;
+      showProgress(p.pct || 0, p.message || '분석 중…', false);
+      pollJob(jid).catch(e => setStatus('오류: ' + e.message, 'err')).finally(() => $('#go').disabled = false);
+    } else {
+      MN.clearJob();
+      setStatus('');
+    }
+  }).catch(() => { MN.clearJob(); setStatus(''); });
+})();
+</script>
+</body>
+</html>

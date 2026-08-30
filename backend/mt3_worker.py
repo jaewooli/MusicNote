@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""
+MT3 transcription worker — runs in its OWN venv (~/mt3-venv, PyTorch-only) as a
+pm2 app, so the mt3-infer dependency tree never touches the main MusicNote venv.
+
+  GET  /health           -> {ok, model, loaded, models}
+  POST /transcribe       body {"wav_path": "...", "model": "mr_mt3"|"yourmt3"|...}
+                         -> {ok, notes:[{start,end,pitch,velocity,program,is_drum,track}],
+                             tracks:[{track,program,is_drum,count}], model, seconds}
+
+The model is lazy-loaded on the first request and (optionally) released after an
+idle period, because YourMT3 peaks ~7.5 GB on CPU.
+
+Env:
+  MT3_MODEL           default model name                 (default "mr_mt3")
+  MT3_PORT            listen port                        (default 8732)
+  MT3_THREADS        torch intra-op threads             (default 2)
+  MT3_IDLE_UNLOAD    seconds of idle before unload; 0=never (default 600)
+  MT3_CHECKPOINT_DIR passed through to mt3-infer
+"""
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+import traceback
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import numpy as np
+import soundfile as sf
+import torch
+
+MODEL_NAME = os.environ.get("MT3_MODEL", "mr_mt3")
+PORT = int(os.environ.get("MT3_PORT", "8732"))
+THREADS = int(os.environ.get("MT3_THREADS", "2"))
+IDLE_UNLOAD = float(os.environ.get("MT3_IDLE_UNLOAD", "600"))
+TARGET_SR = 16000
+
+torch.set_num_threads(max(1, THREADS))
+
+_lock = threading.Lock()
+# The HTTP server is threaded, but a single MT3 model instance is not a
+# concurrent inference service. Parallel requests multiply its multi-GB peak
+# memory and let pm2 kill the worker mid-response. Keep one real inference at
+# a time even if the main web process is restarted.
+_inference_lock = threading.Lock()
+_model = None
+_model_name = None
+_last_use = 0.0
+
+
+def _get_model(name: str):
+    global _model, _model_name, _last_use
+    with _lock:
+        if _model is not None and _model_name != name:
+            _model = None
+            _model_name = None
+        if _model is None:
+            from mt3_infer import load_model
+            _model = load_model(name, device="cpu")
+            _model_name = name
+        _last_use = time.time()
+        return _model
+
+
+def _maybe_unload():
+    global _model, _model_name
+    if IDLE_UNLOAD <= 0:
+        return
+    while True:
+        time.sleep(30)
+        with _lock:
+            if _model is not None and time.time() - _last_use > IDLE_UNLOAD:
+                _model = None
+                _model_name = None
+                import gc
+                gc.collect()
+
+
+def _to_pretty_midi(result):
+    """mt3-infer backends return either a pretty_midi.PrettyMIDI or a
+    mido.MidiFile (YourMT3). Normalise to pretty_midi."""
+    import pretty_midi
+    if isinstance(result, tuple):
+        result = result[0]
+    if isinstance(result, pretty_midi.PrettyMIDI):
+        return result
+    # mido.MidiFile -> write to a temp file, reload with pretty_midi
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".mid", delete=False) as f:
+        try:
+            result.save(f.name)
+        except AttributeError:
+            result.write(f.name)
+        return pretty_midi.PrettyMIDI(f.name)
+
+
+def transcribe(wav_path: str, model_name: str) -> dict:
+    y, sr = sf.read(wav_path)
+    if getattr(y, "ndim", 1) > 1:
+        y = y.mean(axis=1)
+    y = np.asarray(y, dtype=np.float32)
+    if sr != TARGET_SR:
+        import librosa
+        y = librosa.resample(y, orig_sr=sr, target_sr=TARGET_SR)
+        sr = TARGET_SR
+    dur = len(y) / sr
+
+    model = _get_model(model_name)
+    t0 = time.time()
+    with torch.no_grad():
+        raw = model.transcribe(y, sr=sr)
+    pm = _to_pretty_midi(raw)
+    took = time.time() - t0
+    global _last_use
+    _last_use = time.time()
+
+    notes = []
+    tracks = []
+    for ti, inst in enumerate(pm.instruments):
+        prog = int(inst.program)
+        drum = bool(inst.is_drum)
+        cnt = 0
+        for n in inst.notes:
+            if n.end <= n.start:
+                continue
+            notes.append({
+                "start": round(float(n.start), 4),
+                "end": round(float(n.end), 4),
+                "pitch": int(n.pitch),
+                "velocity": int(max(1, min(127, n.velocity))),
+                "program": prog,
+                "is_drum": drum,
+                "track": ti,
+            })
+            cnt += 1
+        tracks.append({"track": ti, "program": prog, "is_drum": drum, "count": cnt})
+    notes.sort(key=lambda n: (n["start"], n["track"], n["pitch"]))
+    return {"ok": True, "notes": notes, "tracks": tracks,
+            "model": model_name, "seconds": round(took, 1), "duration": round(dur, 2)}
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _send(self, code: int, obj: dict):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):  # quieter
+        pass
+
+    def do_GET(self):
+        if self.path.rstrip("/") == "/health":
+            self._send(200, {"ok": True, "model": MODEL_NAME,
+                             "loaded": _model_name, "models": ["mr_mt3", "mt3_pytorch", "yourmt3"]})
+        else:
+            self._send(404, {"ok": False, "error": "not found"})
+
+    def do_POST(self):
+        if self.path.rstrip("/") != "/transcribe":
+            self._send(404, {"ok": False, "error": "not found"})
+            return
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            req = json.loads(self.rfile.read(n) or b"{}")
+            wav = req["wav_path"]
+            name = req.get("model") or MODEL_NAME
+            if not os.path.exists(wav):
+                self._send(400, {"ok": False, "error": f"no such file: {wav}"})
+                return
+            with _inference_lock:
+                out = transcribe(wav, name)
+            self._send(200, out)
+        except Exception as e:  # noqa: BLE001
+            self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}",
+                             "trace": traceback.format_exc()[-1500:]})
+
+
+def main():
+    threading.Thread(target=_maybe_unload, daemon=True).start()
+    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    print(f"mt3_worker: listening on 127.0.0.1:{PORT}  default model={MODEL_NAME} "
+          f"threads={THREADS} idle_unload={IDLE_UNLOAD}s", flush=True)
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MusicNote — 악보 편집기</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <h1>🎼 <a href="./">MusicNote</a> · 악보 편집기</h1>
+  <span class="sub" id="edTitle"></span>
+  <span class="subnav">
+    <a id="openFullScore" href="#" target="_blank" style="display:none">🖥 전체 악보</a>
+    <a id="backLink" href="./">← 분석 결과로</a>
+  </span>
+</header>
+
+<main>
+  <div id="editorMsg">불러오는 중…</div>
+
+  <div id="editorMain" style="display:none">
+    <div class="card" id="stemCard" style="display:none">
+      <h3 style="margin:0 0 4px">악기 스템 — 편집할 파트 선택</h3>
+      <div class="hint" style="margin-bottom:10px">"이 선율 보기"로 그 악기를 편집기에 불러옵니다.
+        (다성/MT3는 “전체 합침”도 편집 가능)</div>
+      <div id="stemList"></div>
+    </div>
+
+    <div class="card" id="scoreCard">
+      <h3 style="margin:0 0 10px">🎼 악보</h3>
+      <div class="row" id="scoreBar" style="gap:10px; margin-bottom:10px; align-items:flex-end">
+        <label class="field">조표
+          <select id="keySel">
+            <option value="auto">자동 (C)</option>
+            <option>C</option><option>G</option><option>D</option><option>A</option>
+            <option>E</option><option>B</option><option>F</option>
+            <option>Bb</option><option>Eb</option><option>Ab</option>
+          </select>
+        </label>
+        <label class="field">박자표
+          <select id="tsSel">
+            <option>4/4</option><option>3/4</option><option>2/4</option>
+            <option>6/8</option><option>3/8</option>
+          </select>
+        </label>
+        <label class="field">템포(BPM)
+          <input type="number" id="scoreTempo" min="30" max="300" step="1" value="120" style="width:88px" />
+        </label>
+        <button class="ghost" id="saveScore">💾 악보 저장</button>
+        <a class="ghost" id="mxmlDl" href="#" download style="display:none">⬇ MusicXML</a>
+        <a class="ghost" id="midi" href="#" download style="display:none">⬇ MIDI(편집본)</a>
+        <button class="ghost" id="json">⬇ JSON</button>
+        <span class="hint" id="scoreMsg"></span>
+      </div>
+      <div id="score" class="scoreBox score-edit">
+        <div id="scoreInner"><div id="scoreSvg"></div><div id="scoreHead" class="playhead" hidden></div></div>
+      </div>
+      <div class="hint">음표를 <b>클릭</b>하면 선택(피아노 롤과 연동), <b>세로로 드래그</b>하면 음정 이동,
+        Del=삭제. <b>＋ 그리기</b> 켜고 빈 곳 클릭 = 새 음. 다성은 각 지점 <b>최고음</b>으로 표시,
+        리듬은 16분음표 격자 근사. <span style="color:#c85f3b">주황빛</span> = 신뢰도 낮음.
+        <b>💾 저장</b> 또는 편집 시 MusicXML/MIDI 자동 갱신.</div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin:0 0 10px">피아노 롤 (편집)</h3>
+      <div class="row" id="editBar" style="gap:8px; margin:0 0 12px">
+        <label class="field">격자
+          <select id="gridSel">
+            <option value="q">1/4</option>
+            <option value="8">1/8</option>
+            <option value="16" selected>1/16</option>
+            <option value="8t">1/8 셋잇단</option>
+          </select>
+        </label>
+        <button class="ghost" id="drawMode">＋ 그리기</button>
+        <button class="ghost" id="edUp">▲ 반음</button>
+        <button class="ghost" id="edDown">▼ 반음</button>
+        <button class="ghost" id="edDel">선택 삭제</button>
+        <button class="ghost" id="edUndo">↶ 되돌리기</button>
+        <button class="ghost" id="edRedo">다시 ↷</button>
+        <button class="ghost" id="edRevert">원래대로</button>
+        <span class="hint" id="edMsg">노트 클릭=선택 · 드래그=이동 · 오른쪽 끝=길이 · 더블클릭=삭제
+          · Del=삭제 · Ctrl+Z/Y=되돌리기 · ↑↓=반음(Shift=옥타브)</span>
+      </div>
+      <div id="pianoWrap"><div id="rollInner"><canvas id="roll" class="roll-edit" width="1000" height="420"></canvas><div id="rollHead" class="playhead" hidden></div></div></div>
+      <div class="hint">주황 선 = 원래 피치 곡선. 흰 테두리 = 선택된 음.
+        <span style="color:#ff8a8a">빨강 점선</span> = 신뢰도 낮은 음(확인 권장).</div>
+    </div>
+
+    <div class="player" id="synthWrap" style="display:none">
+      <div class="card">
+        <div class="k" style="color:var(--muted);font-size:12px;margin-bottom:4px">
+          편집본 재생 <span id="synthBusy" class="hint"></span></div>
+        <div class="transport">
+          <button class="ghost" id="ppBtn">▶</button>
+          <input type="range" id="seek" min="0" max="1000" step="1" value="0" />
+          <span class="hint" id="tpos">0:00 / 0:00</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin:0 0 10px">음 목록 (<span id="ncount">0</span>)</h3>
+      <div class="tableScroll">
+        <table>
+          <thead><tr><th>#</th><th id="instTh" hidden>악기</th><th>음이름</th><th>MIDI</th><th>주파수(Hz)</th><th>시작(s)</th><th>길이(s)</th><th>세기</th><th id="confTh" hidden>신뢰</th></tr></thead>
+          <tbody id="tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script src="vendor/vexflow.js"></script>
+<script src="musicnote-core.js"></script>
+<script>
+Editor.on = true;                 // this page is edit-only
+function render(d, fromRefine) {   // editor's render = shared bits + title
+  renderCommon(d, fromRefine);
+  $('#edTitle').textContent = d.filename || '';
+}
+Editor.onChange = render;
+
+function msg(text, jid) {
+  const el = $('#editorMsg');
+  el.style.display = 'block';
+  el.innerHTML = text + (jid
+    ? ` <a href="./#job=${jid}">분석 페이지에서 열기</a>` : ' <a href="./">분석 페이지로</a>');
+  $('#editorMain').style.display = 'none';
+}
+
+function openInEditor(r, wantStem) {
+  LAST = r;
+  $('#editorMsg').style.display = 'none';
+  $('#editorMain').style.display = 'block';
+  $('#backLink').href = './#job=' + r.job_id;
+
+  if (Array.isArray(r.stems) && r.stems.length) {
+    $('#stemCard').style.display = '';
+    renderStems(r);
+    let pick = null;
+    if (wantStem === '__all__') pick = null;
+    else if (wantStem && stemFor(r, wantStem)) pick = wantStem;
+    else if (r.active_stem) pick = r.active_stem;
+    else if (r.mode === 'polyphonic' || r.mode === 'mt3') pick = null;
+    else pick = (r.stems.find(s => (s.notes || []).length) || {}).id || null;
+    ACTIVE_STEM = pick;
+    markStem();
+    const shown = pick ? stemView(r, pick) : r;
+    render(shown, false);
+    Editor.load(shown);
+  } else {
+    $('#stemCard').style.display = 'none';
+    ACTIVE_STEM = null;
+    render(r, false);
+    Editor.load(r);
+  }
+}
+
+(function init() {
+  const q = new URLSearchParams(location.search);
+  const jid = q.get('job');
+  const stem = q.get('stem');
+  if (!jid) { msg('작업 ID가 없습니다.'); return; }
+  fetch('api/progress/' + jid).then(r => r.ok ? r.json() : Promise.reject(r.status)).then(p => {
+    if (p.status === 'done') openInEditor(p.result, stem);
+    else if (p.status === 'running') msg('이 곡은 아직 분석 중입니다.', jid);
+    else msg('이 작업을 찾을 수 없습니다 (만료되었을 수 있음).');
+  }).catch(() => msg('불러오기 실패.'));
+})();
+</script>
+</body>
+</html>
