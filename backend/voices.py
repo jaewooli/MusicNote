@@ -57,6 +57,20 @@ def _finish_at(voice: dict, when: float, min_dur: float) -> None:
 
 
 
+def _leap_cost(semitones: int) -> float:
+    """Melodic distance between two consecutive notes of one line.
+
+    Plain ``abs`` charges an octave leap 12.0, which equals the cost of opening
+    a brand new contour, so any octave jump silently started a second voice —
+    the Canon melody was cut at exactly its two octave leaps. An octave keeps
+    the pitch class, so it is musically a near neighbour, not a new performer;
+    displaced intervals are charged their distance from the octave plus a fixed
+    penalty for the displacement itself.
+    """
+    d = abs(int(semitones))
+    return min(float(d), abs(d - 12) + 6.0)
+
+
 def _onset_groups(notes: list[dict], chord_gap: float) -> list[list[dict]]:
     """Cluster nearly simultaneous attacks into one vertical event."""
     groups: list[list[dict]] = []
@@ -88,10 +102,18 @@ def _provisional_contours(notes: list[dict], chord_gap: float,
             for ti, track in enumerate(tracks):
                 gap = start - track["last_start"]
                 overlap = track["last_end"] - start
-                if gap <= chord_gap or gap > continuity_gap or overlap > 0.18:
+                if gap <= chord_gap or gap > continuity_gap:
                     continue
-                cost = (abs(pitch - track["last_pitch"])
-                        + max(0.0, overlap) * 8.0 + min(gap, 2.0) * 0.7)
+                # Overlap is a preference, never a veto. MT3's offsets are far
+                # less reliable than the old 0.18 s allowance assumed: on the
+                # Canon clip it held melody notes 0.32-1.32 s past the next
+                # attack. Vetoing on that locked a line out of its own
+                # continuation, so one monophonic melody ping-ponged between
+                # two contours (a1 -> a2 -> a1 -> a2) — exactly the fracture
+                # this function exists to prevent.
+                cost = (_leap_cost(pitch - track["last_pitch"])
+                        + min(max(0.0, overlap), 0.5) * 2.0
+                        + min(gap, 2.0) * 0.7)
                 if cost <= 12.0:
                     choices.append((cost, ti))
             options.append(choices)
@@ -123,6 +145,13 @@ def _provisional_contours(notes: list[dict], chord_gap: float,
                 tracks.append({"notes": []})
                 ti = len(tracks) - 1
             track = tracks[ti]
+            # A notated line cannot overlap itself. When a line continues, the
+            # previous note ends where the new one starts; this also repairs
+            # MT3's over-held offsets instead of carrying them into the score.
+            if track["notes"]:
+                prev = track["notes"][-1]
+                if float(prev["end"]) > float(note["start"]):
+                    prev["end"] = float(note["start"])
             track["notes"].append(note)
             track["last_pitch"] = int(note["pitch"])
             track["last_start"] = float(note["start"])
