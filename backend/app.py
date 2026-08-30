@@ -903,9 +903,30 @@ def _score_parts(res: dict, stem: Optional[str] = None) -> list[dict]:
             return [{"name": sd.get("label") or sd["id"], "notes": sd.get("notes") or [],
                      "program": sd.get("program", 0), "is_drum": not sd.get("pitched", True)}]
     if stems:
-        out = [{"name": s.get("label") or s["id"], "notes": s.get("notes") or [],
-                "program": s.get("program", 0), "is_drum": not s.get("pitched", True)}
-               for s in stems if s.get("notes")]
+        # MT3 sequence stems are interpretations *inside* one model instrument
+        # track.  Keep them as notation voices in one part; rendering each as a
+        # separate instrument staff was the main reason the score looked unlike
+        # the piano roll. Other engines retain their real stem separation.
+        mt3_groups: dict[str, list[dict]] = {}
+        other = []
+        for s in stems:
+            if not s.get("notes"):
+                continue
+            if s.get("engine") == "mt3":
+                source = s["id"].split("_voice", 1)[0]
+                mt3_groups.setdefault(source, []).append(s)
+            else:
+                other.append(s)
+        out = []
+        for group in mt3_groups.values():
+            first = group[0]
+            name = (first.get("label") or first["id"]).split(" · 시퀀스", 1)[0]
+            out.append({"name": name, "voices": [s.get("notes") or [] for s in group],
+                        "program": first.get("program", 0),
+                        "is_drum": not first.get("pitched", True)})
+        out.extend({"name": s.get("label") or s["id"], "notes": s.get("notes") or [],
+                    "program": s.get("program", 0), "is_drum": not s.get("pitched", True)}
+                   for s in other)
         if out:
             return out
     return [{"name": res.get("filename") or "Music", "notes": res.get("notes") or []}]

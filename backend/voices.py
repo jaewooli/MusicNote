@@ -57,6 +57,79 @@ def _finish_at(voice: dict, when: float, min_dur: float) -> None:
 
 
 
+def _onset_groups(notes: list[dict], chord_gap: float) -> list[list[dict]]:
+    """Cluster nearly simultaneous attacks into one vertical event."""
+    groups: list[list[dict]] = []
+    for note in notes:
+        if not groups or float(note["start"]) - float(groups[-1][0]["start"]) > chord_gap:
+            groups.append([note])
+        else:
+            groups[-1].append(note)
+    return groups
+
+
+def _provisional_contours(notes: list[dict], chord_gap: float,
+                          continuity_gap: float) -> list[list[dict]]:
+    """Join note attacks into contours while tolerating uncertain MT3 offsets.
+
+    MT3 often leaves a prior note 40--150 ms too long. Requiring its literal
+    offset to finish before the next onset fractures one melody into alternating
+    tracks. A small overlap is allowed when pitch/register continuity is
+    convincing; all notes at one onset are assigned *jointly* so chord voices
+    cannot cross merely because the nearest note was claimed first.
+    """
+    tracks: list[dict] = []
+    for group in _onset_groups(notes, chord_gap):
+        group = sorted(group, key=lambda n: n["pitch"])
+        options: list[list[tuple[float, int | None]]] = []
+        for note in group:
+            start, pitch = float(note["start"]), int(note["pitch"])
+            choices = [(12.0, None)]  # cost of opening an independent contour
+            for ti, track in enumerate(tracks):
+                gap = start - track["last_start"]
+                overlap = track["last_end"] - start
+                if gap <= chord_gap or gap > continuity_gap or overlap > 0.18:
+                    continue
+                cost = (abs(pitch - track["last_pitch"])
+                        + max(0.0, overlap) * 8.0 + min(gap, 2.0) * 0.7)
+                if cost <= 12.0:
+                    choices.append((cost, ti))
+            options.append(choices)
+
+        # A chord normally has only 2--6 notes. Exhaustive one-to-one matching
+        # is tiny here and avoids a local nearest-pitch decision swapping lines.
+        best: tuple[float, list[int | None]] | None = None
+        def assign(i: int, used: set[int], cost: float, out: list[int | None]) -> None:
+            nonlocal best
+            if best is not None and cost >= best[0]:
+                return
+            if i == len(group):
+                best = (cost, out[:])
+                return
+            for item_cost, ti in options[i]:
+                if ti is not None and ti in used:
+                    continue
+                if ti is not None:
+                    used.add(ti)
+                out.append(ti)
+                assign(i + 1, used, cost + item_cost, out)
+                out.pop()
+                if ti is not None:
+                    used.remove(ti)
+        assign(0, set(), 0.0, [])
+        assert best is not None
+        for note, ti in zip(group, best[1]):
+            if ti is None:
+                tracks.append({"notes": []})
+                ti = len(tracks) - 1
+            track = tracks[ti]
+            track["notes"].append(note)
+            track["last_pitch"] = int(note["pitch"])
+            track["last_start"] = float(note["start"])
+            track["last_end"] = float(note["end"])
+    return [t["notes"] for t in tracks if t["notes"]]
+
+
 def _aligned_pairs(a: list[dict], b: list[dict], tolerance: float) -> list[tuple[dict, dict]]:
     """One-to-one onset alignment of two provisional melodic lines."""
     pairs, j = [], 0
@@ -113,7 +186,7 @@ def separate_sequences(notes: list[dict], chord_gap: float = 0.035,
 
     # This stage only supplies atomic contours.  The decision to call something
     # a chord happens below with look-ahead across the complete clip.
-    atoms = separate_voices(ns, max_voices=None, chord_gap=chord_gap)
+    atoms = _provisional_contours(ns, chord_gap, continuity_gap)
     parent = list(range(len(atoms)))
 
     def find(x: int) -> int:

@@ -38,3 +38,7 @@ check("one_off_extension",
 check("bass_plus_chord",
       [(0, (40, 60, 64, 67)), (.5, (43, 62, 65, 69)),
        (1, (45, 64, 67, 71))], [3, 9])
+
+# A legato melody survives a short MT3 offset overrun as one contour.
+check("offset_jitter_melody",
+      [(0, (72,)), (.20, (74,)), (.40, (76,)), (.60, (77,))], [4])
