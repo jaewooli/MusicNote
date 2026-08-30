@@ -36,6 +36,7 @@ PORT = int(os.environ.get("MT3_PORT", "8732"))
 THREADS = int(os.environ.get("MT3_THREADS", "2"))
 IDLE_UNLOAD = float(os.environ.get("MT3_IDLE_UNLOAD", "600"))
 TARGET_SR = 16000
+END_PADDING_SECONDS = float(os.environ.get("MT3_END_PADDING_SECONDS", "0.75"))
 
 torch.set_num_threads(max(1, THREADS))
 
@@ -106,6 +107,11 @@ def transcribe(wav_path: str, model_name: str) -> dict:
         y = librosa.resample(y, orig_sr=sr, target_sr=TARGET_SR)
         sr = TARGET_SR
     dur = len(y) / sr
+    # A note beginning just before EOF has no trailing context, making MT3
+    # under-detect final attacks. Silent right padding gives the encoder/decoder
+    # room to close that event; emitted times are clamped back to source length.
+    if END_PADDING_SECONDS > 0:
+        y = np.pad(y, (0, int(round(END_PADDING_SECONDS * sr))))
 
     model = _get_model(model_name)
     t0 = time.time()
@@ -123,11 +129,13 @@ def transcribe(wav_path: str, model_name: str) -> dict:
         drum = bool(inst.is_drum)
         cnt = 0
         for n in inst.notes:
-            if n.end <= n.start:
+            start = float(n.start)
+            end = min(float(n.end), dur)
+            if start >= dur or end <= start:
                 continue
             notes.append({
-                "start": round(float(n.start), 4),
-                "end": round(float(n.end), 4),
+                "start": round(start, 4),
+                "end": round(end, 4),
                 "pitch": int(n.pitch),
                 "velocity": int(max(1, min(127, n.velocity))),
                 "program": prog,

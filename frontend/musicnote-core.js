@@ -136,7 +136,7 @@ function stemView(r, id) {
     musicxml_url: r.musicxml_url || null, edited: !!r.edited,
     audio_url: r.audio_url,
     filename: (r.filename || '') + ' — ' + (s.label || id),
-    job_id: r.job_id, _stem: id, warning: s.warning,
+    job_id: r.job_id, _stem: id, warning: s.warning, validation: r.validation,
   };
 }
 
@@ -252,10 +252,12 @@ function renderCommon(d, fromRefine) {
 function drawRoll(d) {
   const cv = $('#roll'); if (!cv) return;
   const notes = d.notes;
+  const confirmed = (d.validation && d.validation.confirmed_missing_notes) || [];
   const ctx = cv.getContext('2d');
-  const dur = Math.max(d.duration, ...notes.map(n => n.end), 1);
+  const dur = Math.max(d.duration, ...notes.map(n => n.end), ...confirmed.map(n => n.end || n.start), 1);
   let lo = 127, hi = 0;
   notes.forEach(n => { lo = Math.min(lo, n.pitch); hi = Math.max(hi, n.pitch); });
+  confirmed.forEach(n => { lo = Math.min(lo, n.pitch); hi = Math.max(hi, n.pitch); });
   if (hi < lo) { lo = 48; hi = 72; }
   lo -= 2; hi += 2;
 
@@ -310,6 +312,21 @@ function drawRoll(d) {
       ctx.strokeStyle = 'rgba(255,255,255,.25)'; ctx.strokeRect(x + .5, y + 1.5, w, rh - 3);
     }
   });
+  // A dashed orange mark is a CQT attack confirmed by a second model, not
+  // an inserted note. It deliberately remains outside playback/MIDI until a
+  // future explicit user-approval action is chosen.
+  confirmed.forEach(n => {
+    const x = n.start * pxPerSec, y = (hi - Math.round(n.pitch)) * rh;
+    const w = Math.max(5, ((n.end || n.start + .12) - n.start) * pxPerSec);
+    ctx.save(); ctx.strokeStyle = '#ffb454'; ctx.lineWidth = 2;
+    ctx.setLineDash([4, 3]); ctx.strokeRect(x + 1, y + 1.5, w, rh - 3);
+    ctx.setLineDash([]); ctx.fillStyle = '#ffb454'; ctx.font = '10px system-ui';
+    ctx.fillText('?', x + 2, Math.max(10, y - 2)); ctx.restore();
+  });
+  if (confirmed.length) {
+    ctx.fillStyle = '#ffb454'; ctx.font = '10px system-ui';
+    ctx.fillText('주황 점선 ? = 2차 확인된 누락 후보 (자동 추가 안 함)', 6, H - 6);
+  }
   if (tagged && LAST && LAST.stems) {
     let lx = 6;
     ctx.font = '10px system-ui';

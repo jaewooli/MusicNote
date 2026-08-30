@@ -209,7 +209,7 @@ function render(d, fromRefine) {
     ...(d.validation ? [['성부 검증', d.validation.structural.passed
       ? `${d.validation.structural.sequence_count ?? d.validation.structural.voice_count}개 시퀀스 · 화음 겹침 허용 ✓`
       : `시퀀스 검증 필요 ⚠`],
-      ['음향 누락 후보', `${(d.validation.missed_onset_candidates || []).length}개 — 자동 추가하지 않고 검토용`]] : []),
+      ['음향 누락 후보', `${(d.validation.missed_onset_candidates || []).length}개 · 2차 확인 ${(d.validation.confirmed_missing_notes || []).length}개 — 자동 추가하지 않고 검토용`]] : []),
     ...(d.low_conf ? [['낮은 신뢰 음', `${d.low_conf}개 — 표·롤·악보에서 표시`]] : []),
   ].map(([k, v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
 
