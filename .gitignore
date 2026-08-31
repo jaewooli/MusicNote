@@ -13,3 +13,7 @@ eval/refs/*.mt3*.json
 
 # staged by deploy/vast/build.sh, never committed (700 MB of model weights)
 deploy/vast/checkpoints/
+
+# written by deploy/vast/gpu.sh — the rented GPU worker's URL and instance id
+deploy/vast/current-url
+deploy/vast/current-instance

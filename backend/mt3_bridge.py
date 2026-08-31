@@ -18,7 +18,15 @@ import urllib.error
 import urllib.request
 
 MT3_URL = os.environ.get("MUSICNOTE_MT3_URL", "http://127.0.0.1:8732").rstrip("/")
+# Where the fallback worker lives. Separate from MT3_URL so that when MT3_URL
+# points at a rented GPU box we still know how to reach the local one.
+LOCAL_URL = os.environ.get("MUSICNOTE_MT3_LOCAL_URL",
+                           "http://127.0.0.1:8732").rstrip("/")
 # "local"  -> same-host pm2 worker, audio passed by path (no copy).
+# "remote" -> a rented GPU box running the same worker at MT3_URL, audio
+#             uploaded. No autoscaler: the box is started and stopped by hand,
+#             which trades idle storage rent for skipping the multi-minute
+#             cold start a scale-to-zero worker pays on every request.
 # "vast"   -> vast.ai serverless endpoint via the vastai SDK, audio uploaded.
 BACKEND = os.environ.get("MUSICNOTE_MT3_BACKEND", "local")
 VAST_ENDPOINT = os.environ.get("MUSICNOTE_VAST_ENDPOINT", "musicnote-mt3")
@@ -139,9 +147,23 @@ def transcribe(wav_path: str, model: str | None = None,
             print(f"mt3 remote backend failed ({type(e).__name__}: {e}); "
                   f"falling back to the local worker", flush=True)
 
-    payload = _payload(wav_path, model, shift, upload=False)
+    if BACKEND == "remote":
+        try:
+            return _post(MT3_URL, _payload(wav_path, model, shift, upload=True),
+                         timeout)
+        except Exception as e:  # noqa: BLE001  (box stopped, or still booting)
+            if not REMOTE_FALLBACK:
+                raise
+            print(f"mt3 remote backend failed ({type(e).__name__}: {e}); "
+                  f"falling back to the local worker", flush=True)
+
+    return _post(LOCAL_URL, _payload(wav_path, model, shift, upload=False),
+                 timeout)
+
+
+def _post(url: str, payload: dict, timeout: int) -> dict:
     body = json.dumps(payload).encode()
-    req = urllib.request.Request(MT3_URL + "/transcribe", data=body,
+    req = urllib.request.Request(url + "/transcribe", data=body,
                                  headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:

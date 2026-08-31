@@ -17,6 +17,7 @@ Env:
   MT3_MODEL           default model name                 (default "mr_mt3")
   MT3_DEVICE         torch device: cpu|cuda|auto        (default "cpu")
   MT3_PORT            listen port                        (default 8732)
+  MT3_HOST            listen address                     (default 127.0.0.1)
   MT3_THREADS        torch intra-op threads             (default 2)
   MT3_IDLE_UNLOAD    seconds of idle before unload; 0=never (default 600)
   MT3_CHECKPOINT_DIR passed through to mt3-infer
@@ -36,6 +37,12 @@ import torch
 
 MODEL_NAME = os.environ.get("MT3_MODEL", "mr_mt3")
 PORT = int(os.environ.get("MT3_PORT", "8732"))
+# Loopback by default: the pm2 worker shares a host with the app and must not be
+# reachable from outside it. A rented GPU box is the opposite case — the app is
+# on another machine — so the container image sets MT3_HOST=0.0.0.0. There is no
+# authentication here, so anything but loopback needs the port firewalled to the
+# app server.
+HOST = os.environ.get("MT3_HOST", "127.0.0.1")
 THREADS = int(os.environ.get("MT3_THREADS", "2"))
 # "auto" lets mt3_infer pick CUDA when present. Kept at cpu by default so the
 # local pm2 worker never silently changes behaviour.
@@ -239,8 +246,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     threading.Thread(target=_maybe_unload, daemon=True).start()
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"mt3_worker: listening on 127.0.0.1:{PORT}  default model={MODEL_NAME} "
+    srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f"mt3_worker: listening on {HOST}:{PORT}  default model={MODEL_NAME} "
           f"device={DEVICE} threads={THREADS} idle_unload={IDLE_UNLOAD}s", flush=True)
     srv.serve_forever()
 

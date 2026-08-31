@@ -3,7 +3,19 @@
 //   pm2 logs musicnote
 //   pm2 restart musicnote
 const path = require('path');
+const fs = require('fs');
 const ROOT = __dirname;
+
+// A rented GPU worker's URL, written by deploy/vast/gpu.sh. When the file is
+// absent the app uses the local CPU worker, so the GPU is opt-in and its
+// absence is never a failure — mt3_bridge falls back on its own too.
+const GPU_URL_FILE = path.join(ROOT, 'deploy/vast/current-url');
+const GPU_URL = fs.existsSync(GPU_URL_FILE)
+  ? fs.readFileSync(GPU_URL_FILE, 'utf8').trim()
+  : '';
+const MT3_ENV = GPU_URL
+  ? { MUSICNOTE_MT3_BACKEND: 'remote', MUSICNOTE_MT3_URL: GPU_URL }
+  : {};
 
 module.exports = {
   apps: [
@@ -22,6 +34,7 @@ module.exports = {
         PYTHONUNBUFFERED: '1',
         MUSICNOTE_WORKDIR: path.join(ROOT, 'uploads'),
         MUSICNOTE_MAX_MB: '40',
+        ...MT3_ENV,
         MUSICNOTE_MAX_DURATION: '1200',            // YouTube: max 20 min
         MUSICNOTE_STEMS_MAX_DURATION: '300',       // stems mode: max 5 min (slow on CPU)
         OMP_NUM_THREADS: '4',
