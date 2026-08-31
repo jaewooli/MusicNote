@@ -27,7 +27,10 @@ def _dyn_mark(vel: int) -> str:
 
 
 def _note_xml(n, dur: int, ty: str, dots: int, tup, tup_start: bool,
-              tup_stop: bool, chord: bool) -> str:
+              tup_stop: bool, chord: bool, voice: int = 1, staff: str = "") -> str:
+    """One <note>. MusicXML fixes the child order (… tie, voice, type, dot,
+    time-modification, staff, notations), and importers that reject a file
+    silently are the reason to follow it exactly."""
     bits = ["<note>"]
     if chord:
         bits.append("<chord/>")
@@ -39,11 +42,13 @@ def _note_xml(n, dur: int, ty: str, dots: int, tup, tup_start: bool,
         bits.append('<tie type="stop"/>')
     if n.tie_start:
         bits.append('<tie type="start"/>')
+    bits.append(f"<voice>{voice}</voice>")
     bits.append(f"<type>{ty}</type>")
     bits.append("<dot/>" * dots)
     if tup:
         bits.append(f"<time-modification><actual-notes>{tup[0]}</actual-notes>"
                     f"<normal-notes>{tup[1]}</normal-notes></time-modification>")
+    bits.append(staff)
     nots = []
     if n.tie_stop:
         nots.append('<tied type="stop"/>')
@@ -85,14 +90,22 @@ def doc_to_musicxml(doc: ScoreDoc) -> str:
         for mi in range(n_meas):
             out.append(f'<measure number="{mi + 1}">')
             if mi == 0:
-                clef = ("<sign>F</sign><line>4</line>" if p.clef == "bass"
-                        else "<sign>G</sign><line>2</line>")
+                clefs = list(p.clefs or [p.clef])[:max(1, p.staves)]
+                while len(clefs) < max(1, p.staves):
+                    clefs.append(p.clef)
+                cx = "".join(
+                    f'<clef number="{i + 1}">'
+                    + ("<sign>F</sign><line>4</line>" if c == "bass"
+                       else "<sign>G</sign><line>2</line>")
+                    + "</clef>"
+                    for i, c in enumerate(clefs))
+                staves = (f'<staves>{p.staves}</staves>' if p.staves > 1 else "")
                 out.append(
                     f'<attributes><divisions>{doc.divisions}</divisions>'
                     f'<key><fifths>{doc.key_fifths}</fifths></key>'
                     f'<time><beats>{doc.time_sig[0]}</beats>'
                     f'<beat-type>{doc.time_sig[1]}</beat-type></time>'
-                    f'<clef>{clef}</clef></attributes>')
+                    f'{staves}{cx}</attributes>')
                 bpm = int(round(doc.tempo))
                 out.append('<direction placement="above"><direction-type><metronome>'
                            '<beat-unit>quarter</beat-unit>'
@@ -112,11 +125,12 @@ def doc_to_musicxml(doc: ScoreDoc) -> str:
                         continue
                 if mi >= len(v.measures):
                     continue
+                staff_x = f"<staff>{v.staff}</staff>" if p.staves > 1 else ""
                 for c in v.measures[mi].events:
                     if c.is_rest:
                         out.append(f'<note><rest/><duration>{c.dur}</duration>'
                                    f'<voice>{v.number}</voice><type>{c.type}</type>'
-                                   + "<dot/>" * c.dots + '</note>')
+                                   + "<dot/>" * c.dots + staff_x + '</note>')
                         continue
                     vel = max(n.velocity for n in c.notes)
                     dyn = max(5, min(200, round(vel / 90 * 100)))
@@ -127,11 +141,10 @@ def doc_to_musicxml(doc: ScoreDoc) -> str:
                                    '</direction>')
                         last_dyn = dyn
                     for k, n in enumerate(c.notes):
-                        x = _note_xml(n, c.dur, c.type, c.dots, c.tuplet,
-                                      c.tuplet_start, c.tuplet_stop, chord=k > 0)
-                        x = x.replace("</note>",
-                                      f"<voice>{v.number}</voice></note>")
-                        out.append(x)
+                        out.append(_note_xml(
+                            n, c.dur, c.type, c.dots, c.tuplet, c.tuplet_start,
+                            c.tuplet_stop, chord=k > 0, voice=v.number,
+                            staff=staff_x))
             out.append('</measure>')
         out.append('</part>')
     out.append('</score-partwise>')

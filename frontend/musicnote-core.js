@@ -2,13 +2,24 @@
 'use strict';
 const $ = s => document.querySelector(s);
 let LAST = null, CUR = null, ROLL = null, ACTIVE_STEM = null;
-let synthURL = null, synthToken = 0, TEMPO_TOUCHED = false;
+let synthURL = null, synthToken = 0, TEMPO_TOUCHED = false, TS_TOUCHED = false;
 
 const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
 const midiName = m => { m = Math.round(m); return NOTE_NAMES[((m % 12) + 12) % 12] + (Math.floor(m / 12) - 1); };
 const midiFreq = m => +(440 * Math.pow(2, (m - 69) / 12)).toFixed(2);
 
 function curTS() { const el = $('#tsSel'); const p = ((el && el.value) || '4/4').split('/').map(Number); return [p[0] || 4, p[1] || 4]; }
+// Select the detected signature, adding the option if the list lacks it — the
+// detector can return meters the fixed list was never given (6/4, 12/8).
+function setTS(ts) {
+  const el = $('#tsSel');
+  if (!el || !Array.isArray(ts) || !ts[0] || !ts[1]) return;
+  const want = ts[0] + '/' + ts[1];
+  if (![...el.options].some(o => o.value === want || o.text === want)) {
+    const o = document.createElement('option'); o.value = o.text = want; el.appendChild(o);
+  }
+  el.value = want;
+}
 function curTempo() { const el = $('#scoreTempo'); return (el && +el.value) || (CUR && CUR.tempo) || 120; }
 
 function confColor(c) {
@@ -230,6 +241,11 @@ function renderCommon(d, fromRefine) {
   if (ks && ks.options[0]) ks.options[0].textContent = d.key ? `자동 (${d.key})` : '자동 (C)';
   const st = $('#scoreTempo');
   if (st && !fromRefine && !TEMPO_TOUCHED && +d.tempo) st.value = Math.round(d.tempo);
+  // The backend now detects the time signature (meter.detect), so show what it
+  // found instead of leaving the box on 4/4. Once the user picks one it stays.
+  if (!fromRefine && !TS_TOUCHED) setTS(d.time_sig);
+  const tsh = $('#tsHint');
+  if (tsh && Array.isArray(d.time_sig)) tsh.textContent = d.time_sig[0] + '/' + d.time_sig[1];
 
   const oe = $('#openEditor');
   if (oe && d.job_id) {
@@ -481,6 +497,23 @@ function transportFrame(t, dur) {
 })();
 
 // ---- playhead on the roll + the score --------------------------------------
+// Keep `px` visible inside whichever box actually scrolls. The result page
+// draws the score into a box that grows instead of scrolling, so following the
+// playhead there means scrolling the window; the editor and the full-score page
+// scroll their own container.
+function _follow(el, px, py, h) {
+  if (el && el.scrollWidth > el.clientWidth + 4) {
+    if (px < el.scrollLeft + 20 || px > el.scrollLeft + el.clientWidth - 30)
+      el.scrollLeft = Math.max(0, px - el.clientWidth * 0.3);
+  }
+  if (el && el.scrollHeight > el.clientHeight + 4) {
+    if (py < el.scrollTop + 10 || py + h > el.scrollTop + el.clientHeight - 10)
+      el.scrollTop = Math.max(0, py - el.clientHeight * 0.35);
+    return;
+  }
+  return true;      // container did not scroll vertically — caller may pan the page
+}
+
 const Playhead = {
   move(t) {
     const rh = $('#rollHead');
@@ -495,29 +528,67 @@ const Playhead = {
           wrap.scrollLeft = Math.max(0, want);
       }
     }
-    const sh = $('#scoreHead'), L = Score._layout;
-    if (sh && L && L.length) {
-      const m = L.find(z => t >= z.tStart && t < z.tEnd) || (t <= 0 ? L[0] : null);
-      if (!m) { sh.hidden = true; return; }
-      const x = m.x + (t - m.tStart) / (m.tEnd - m.tStart) * m.w;
-      sh.hidden = !Player.playing && t <= 0;
-      sh.style.left = x + 'px';
-      sh.style.top = m.y + 'px';
-      sh.style.height = m.h + 'px';
-      if (Player.playing) {
-        const box = $('#score') || $('#fullScore');
-        if (box && (x < box.scrollLeft || x > box.scrollLeft + box.clientWidth - 30))
-          box.scrollLeft = Math.max(0, x - box.clientWidth * 0.3);
-        // follow vertically when the score is a tall multi-system page
-        if ($('#fullScore') && !$('#score')) {
-          const py = sh.getBoundingClientRect().top;
-          if (py < 90 || py > window.innerHeight - 90)
-            window.scrollBy({ top: py - window.innerHeight * 0.35, behavior: 'instant' });
-        }
-      }
+    const sh = $('#scoreHead');
+    if (!sh) return;
+    const hit = scoreXAt(t);
+    if (!hit) { sh.hidden = true; return; }
+    const m = hit.m;
+    sh.hidden = !Player.playing && t <= 0;
+    sh.style.left = hit.x + 'px';
+    sh.style.top = m.y + 'px';
+    sh.style.height = m.h + 'px';
+    if (!Player.playing) return;
+    const box = $('#score') || $('#fullScore') || $('#scoreSvg');
+    if (_follow(box, hit.x, m.y, m.h)) {
+      // the box itself is not scrollable vertically: pan the page instead, so a
+      // score that wraps onto many systems still follows the music
+      const r = sh.getBoundingClientRect();
+      if (r.top < 80 || r.bottom > window.innerHeight - 60)
+        window.scrollBy({ top: r.top - window.innerHeight * 0.3, behavior: 'instant' });
     }
   },
 };
+
+// ---- click the score to move the playback position -------------------------
+// Bound on the wrapper (not the SVG) so it survives every re-render.
+function bindScoreSeek() {
+  {
+    const wrap = $('#scoreInner');
+    if (!wrap || wrap._seekBound) return;
+    wrap._seekBound = true;
+    wrap.addEventListener('click', e => {
+      if (typeof Editor !== 'undefined' && Editor.on) return;   // editing owns clicks
+      if (!Player.dur) return;
+      const svg = $('#scoreSvg') || wrap;
+      const r = svg.getBoundingClientRect();
+      const t = scoreTimeAt(e.clientX - r.left, e.clientY - r.top);
+      if (t !== null) Player.seek(t);
+    });
+  }
+}
+if (document.readyState === 'loading')
+  document.addEventListener('DOMContentLoaded', bindScoreSeek);
+else bindScoreSeek();
+
+// ---- redraw the score when the window width changes ------------------------
+// The layout is measured off the box width, so without this the staves, and the
+// playhead positions derived from them, drift out of the visible area.
+(function wireScoreResize() {
+  let t = null, w = window.innerWidth;
+  window.addEventListener('resize', () => {
+    if (window.innerWidth === w) return;
+    w = window.innerWidth;
+    clearTimeout(t);
+    t = setTimeout(() => {
+      if (Score._doc && Score._docBox && Score._docBox.isConnected) {
+        renderDoc(Score._docBox, Score._doc, Score._docOpts);
+        Playhead.move(Player.now());
+      } else if (Score._d) {
+        Score.render(Score._d);
+      }
+    }, 180);
+  });
+})();
 
 // ===================== Notation (VexFlow) ==============================
 function topContour(notes) {
@@ -614,6 +685,7 @@ function spell(midi, keyName) {
 
 const Score = {
   timer: null, _layout: [], _hit: [], _d: null, _staff: null, _docSeq: 0,
+  _doc: null, _docBox: null, _docOpts: null,
   render(d) {
     clearTimeout(this.timer);
     this._d = d;
@@ -650,6 +722,7 @@ const Score = {
     const box = $('#scoreSvg') || $('#score');
     if (!box) return;
     this._d = d; this._layout = []; this._hit = [];
+    this._doc = null;              // legacy path: nothing for resize to redraw
     if (!window.Vex) { box.innerHTML = '<div class="hint" style="padding:18px">악보 렌더러(vexflow) 로드 실패</div>'; return; }
     if (!d || !d.notes || !d.notes.length) { box.innerHTML = '<div class="hint" style="padding:18px">표시할 음표가 없습니다.</div>'; return; }
     try { this._draw(box, d); }
@@ -777,19 +850,39 @@ function _vfKey(n) {
   return n.step.toLowerCase() + acc + '/' + n.octave;
 }
 
+// Rest lines for a staff carrying two voices: the upper voice's rests sit
+// above the middle line, the lower voice's below, so they stop colliding.
+const REST_KEY = {
+  treble: ['d/5', 'f/4'], bass: ['f/3', 'b/2'],
+};
+function _restKey(clef, vi, two) {
+  const pair = REST_KEY[clef] || REST_KEY.treble;
+  return two ? pair[Math.min(vi, 1)] : (clef === 'bass' ? 'd/3' : 'b/4');
+}
+
 function renderDoc(box, doc, opts) {
   opts = opts || {};
   Score._layout = [];
+  Score._doc = doc; Score._docBox = box; Score._docOpts = opts;
   if (!window.Vex) { box.innerHTML = '<p class="hint" style="padding:20px">악보 렌더러 로드 실패</p>'; return; }
   const VF = Vex.Flow;
   const parts = (doc.parts || []).filter(p => p.voices && p.voices.length);
   if (!parts.length) { box.innerHTML = '<p class="hint" style="padding:20px">표시할 음표가 없습니다.</p>'; return; }
 
+  const nStaves = p => Math.max(1, p.staves || 1);
+  const clefOf = (p, si) => (p.clefs && p.clefs[si]) || p.clef || 'treble';
+  const totalStaves = parts.reduce((a, p) => a + nStaves(p), 0);
   const nMeas = Math.min(opts.cap || 300,
     Math.max(...parts.map(p => Math.max(...p.voices.map(v => v.measures.length)))));
+  const keyName = fifthsToKey(doc.key_fifths);
+  const tsStr = doc.time_sig[0] + '/' + doc.time_sig[1];
+  // Beam by beat, not across the whole bar: one 12-note beam over a 3/4 measure
+  // is unreadable and hides where the beats are.
+  let beamGroups;
+  try { beamGroups = VF.Beam.getDefaultBeamGroups(tsStr); } catch (_) { beamGroups = undefined; }
+
   const secPerQ = 60 / (doc.tempo || 120);
-  const quartersPerMeasure = doc.time_sig[0] * 4 / doc.time_sig[1];
-  const fallbackMeasureSec = quartersPerMeasure * secPerQ;
+  const fallbackMeasureSec = doc.time_sig[0] * 4 / doc.time_sig[1] * secPerQ;
   const measureTime = mi => {
     for (const p of parts) for (const v of p.voices) {
       const m = v.measures[mi];
@@ -800,127 +893,335 @@ function renderDoc(box, doc, opts) {
   };
 
   const W = Math.max(720, Math.min(box.clientWidth || 1000, 1600));
-  const partH = opts.partH || 96, sysGap = 36, labelW = parts.length > 1 ? 104 : 8, margin = 16;
-  const per = Math.max(1, Math.min(6, Math.floor((W - margin * 2 - labelW) / 210)));
-  const sw = Math.floor((W - margin * 2 - labelW) / per);
-  const systems = Math.ceil(nMeas / per);
-  const H = systems * (parts.length * partH + sysGap) + 30;
+  const staffH = opts.partH || 96, sysGap = 36;
+  const labelW = parts.length > 1 ? 104 : 8, margin = 16;
+  const avail = Math.max(260, W - margin * 2 - labelW);
+
+  // --- 1. build every measure's notes, and ask how much room they really need
+  const built = [];
+  for (let mi = 0; mi < nMeas; mi++) built.push(buildMeasure(mi));
+
+  function buildMeasure(mi) {
+    const rows = [];
+    let minW = 0, tpm = 0;
+    parts.forEach(p => {
+      for (let si = 0; si < nStaves(p); si++) {
+        const clef = clefOf(p, si);
+        const src = p.voices.filter(v => (v.staff || 1) === si + 1);
+        const live = src.filter(v => {
+          const m = v.measures[mi];
+          return m && m.events.length && m.events.some(e => e.notes && e.notes.length);
+        });
+        // A voice resting through the whole measure adds nothing but a second
+        // layer of rests — print it only when the staff is otherwise empty.
+        const show = live.length ? live
+          : src.filter(v => v.measures[mi] && v.measures[mi].events.length).slice(0, 1);
+        const two = show.length > 1;
+        const row = { clef, part: p, voices: [], tuplets: [], ties: [] };
+        show.forEach((v, vi) => {
+          const dir = two ? (vi === 0 ? VF.Stem.UP : VF.Stem.DOWN) : null;
+          const vf = [];
+          v.measures[mi].events.forEach(e => {
+            const code = VF_DUR[e.type] || 'q';
+            let n;
+            if (!e.notes || !e.notes.length) {
+              n = new VF.StaveNote({ clef, keys: [_restKey(clef, vi, two)],
+                duration: code + 'r' });
+            } else {
+              n = new VF.StaveNote({ clef, keys: e.notes.map(_vfKey), duration: code });
+              e.notes.forEach((nn, i) => {
+                if (nn.alter && VF_ACC[nn.alter])
+                  n.addModifier(new VF.Accidental(VF_ACC[nn.alter]), i);
+              });
+              if (e.notes.some(nn => nn.conf !== undefined && nn.conf < 0.5))
+                n.setStyle({ fillStyle: '#c85f3b', strokeStyle: '#c85f3b' });
+              if (dir !== null) n.setStemDirection(dir);
+            }
+            if (e.dots) VF.Dot.buildAndAttach([n], { all: true });
+            n._ev = e;
+            vf.push(n);
+          });
+          if (!vf.length) return;
+          const voice = new VF.Voice({ num_beats: doc.time_sig[0], beat_value: doc.time_sig[1] })
+            .setMode(VF.Voice.Mode.SOFT);
+          voice.addTickables(vf);
+          voice._dir = dir;
+          row.voices.push(voice);
+          tpm = Math.max(tpm, vf.reduce((a, n) => a + ((n._ev && n._ev.dur) || 0), 0));
+          let i = 0;
+          while (i < vf.length) {                       // tuplet brackets
+            if (!vf[i]._ev.tuplet) { i++; continue; }
+            let j = i;
+            while (j + 1 < vf.length && vf[j + 1]._ev.tuplet && !vf[j]._ev.tuplet_stop) j++;
+            if (j > i) {
+              const t = vf[i]._ev.tuplet;
+              try {
+                row.tuplets.push(new VF.Tuplet(vf.slice(i, j + 1),
+                  { num_notes: t[0], notes_occupied: t[1] }));
+              } catch (_) {}
+            }
+            i = j + 1;
+          }
+          for (let k = 0; k + 1 < vf.length; k++) {     // ties inside the measure
+            const a = vf[k]._ev, b = vf[k + 1]._ev;
+            if (a.notes && a.notes.length && a.notes[0].tie_start
+                && b.notes && b.notes.length && b.notes[0].tie_stop)
+              row.ties.push([vf[k], vf[k + 1]]);
+          }
+        });
+        if (row.voices.length) {
+          try {
+            const f = new VF.Formatter().joinVoices(row.voices);
+            minW = Math.max(minW, f.preCalculateMinTotalWidth(row.voices));
+          } catch (_) { minW = Math.max(minW, 180); }
+        }
+        rows.push(row);
+      }
+    });
+    return { rows, minW: Math.max(60, minW), tpm: tpm || 1 };
+  }
+
+  // How much of a measure the clef / key / time signature eats.
+  const hdrCache = {};
+  function headerW(withTime) {
+    const k = withTime ? 1 : 0;
+    if (hdrCache[k] != null) return hdrCache[k];
+    let w = 0;
+    parts.forEach(p => {
+      for (let si = 0; si < nStaves(p); si++) {
+        const st = new VF.Stave(0, 0, 300);
+        st.addClef(clefOf(p, si));
+        if (keyName !== 'C') st.addKeySignature(keyName);
+        if (withTime) st.addTimeSignature(tsStr);
+        try { w = Math.max(w, st.getNoteStartX()); } catch (_) { w = Math.max(w, 90); }
+      }
+    });
+    return (hdrCache[k] = w);
+  }
+
+  // --- 2. pack measures into systems by the width they actually need, so a bar
+  //        of 16ths gets room and a bar of whole notes does not hog it. Equal
+  //        widths were why dense bars spilled their notes past the barline.
+  const MEAS_PAD = 16, MAX_PER_SYS = 8;
+  const systems = [];
+  let cur = null;
+  for (let mi = 0; mi < nMeas; mi++) {
+    const need = built[mi].minW + MEAS_PAD;
+    if (cur && (cur.mis.length >= MAX_PER_SYS || cur.need + need > avail)) {
+      systems.push(cur); cur = null;
+    }
+    if (!cur) cur = { mis: [], need: headerW(mi === 0), hdr: headerW(mi === 0) };
+    cur.need += need;
+    cur.mis.push(mi);
+  }
+  if (cur && cur.mis.length) systems.push(cur);
+
+  systems.forEach((sy, si) => {
+    const base = sy.mis.map(mi => built[mi].minW + MEAS_PAD);
+    const sum = base.reduce((a, b) => a + b, 0);
+    // Stretch every system to the full width — except a short last one, which
+    // looks wrong blown up across the page.
+    const target = si === systems.length - 1
+      ? Math.min(avail, Math.max(sum + sy.hdr, avail * 0.5))
+      : avail;
+    const extra = Math.max(0, target - sum - sy.hdr);
+    sy.widths = base.map((b, k) => Math.round(b + extra * (b / (sum || 1))
+      + (k === 0 ? sy.hdr : 0)));
+  });
+
+  const sysH = totalStaves * staffH + sysGap;
+  const H = systems.length * sysH + 30;
 
   box.innerHTML = '';
   const renderer = new VF.Renderer(box, VF.Renderer.Backends.SVG);
   renderer.resize(W, H);
   const ctx = renderer.getContext();
   ctx.setFont('Arial', 9);
-  const keyName = fifthsToKey(doc.key_fifths);
 
-  for (let mi = 0; mi < nMeas; mi++) {
-    const sys = Math.floor(mi / per), col = mi % per;
-    const x = margin + labelW + col * sw;
-    const sysY = 16 + sys * (parts.length * partH + sysGap);
-    const staves = [];
-    parts.forEach((p, pi) => {
-      const y = sysY + pi * partH;
-      const st = new VF.Stave(x, y, sw);
-      if (col === 0) {
-        st.addClef(p.clef || 'treble');
-        if (keyName !== 'C') st.addKeySignature(keyName);
-      }
-      if (mi === 0) st.addTimeSignature(doc.time_sig[0] + '/' + doc.time_sig[1]);
-      st.setContext(ctx).draw();
-      staves.push(st);
-      if (col === 0 && parts.length > 1 && p.name) {
-        try { ctx.save(); ctx.setFont('Arial', 10);
-          ctx.fillText(String(p.name).slice(0, 12), 6, y + partH * 0.42); ctx.restore(); } catch (_) {}
-      }
-
-      const voices = [], allTuplets = [], allTies = [];
-      p.voices.forEach(v => {
-        const meas = v.measures[mi];
-        if (!meas || !meas.events.length) return;
-        const vf = [];
-        meas.events.forEach(e => {
-          const code = VF_DUR[e.type] || 'q';
-          let n;
-          if (!e.notes || !e.notes.length) {
-            n = new VF.StaveNote({ clef: p.clef || 'treble',
-              keys: [(p.clef === 'bass') ? 'd/3' : 'b/4'], duration: code + 'r' });
-          } else {
-            const keys = e.notes.map(_vfKey);
-            n = new VF.StaveNote({ clef: p.clef || 'treble', keys, duration: code });
-            e.notes.forEach((nn, i) => {
-              if (nn.alter && VF_ACC[nn.alter])
-                n.addModifier(new VF.Accidental(VF_ACC[nn.alter]), i);
+  // --- 3. draw
+  systems.forEach((sy, syi) => {
+    const sysY = 16 + syi * sysH;
+    let x = margin + labelW;
+    sy.mis.forEach((mi, col) => {
+      const sw = sy.widths[col];
+      const b = built[mi];
+      const staves = [], braces = [], marks = [];
+      let row = 0, ri = 0;
+      parts.forEach(p => {
+        const first = staves.length;
+        for (let si = 0; si < nStaves(p); si++, row++, ri++) {
+          const r = b.rows[ri];
+          const st = new VF.Stave(x, sysY + row * staffH, sw);
+          if (col === 0) {
+            st.addClef(r.clef);
+            if (keyName !== 'C') st.addKeySignature(keyName);
+            if (mi === 0) st.addTimeSignature(tsStr);
+          }
+          st.setContext(ctx).draw();
+          staves.push(st);
+          if (col === 0 && si === 0 && parts.length > 1 && p.name) {
+            try {
+              ctx.save(); ctx.setFont('Arial', 10);
+              ctx.fillText(String(p.name).slice(0, 12), 6,
+                sysY + row * staffH + staffH * 0.42);
+              ctx.restore();
+            } catch (_) {}
+          }
+          if (!r.voices.length) continue;
+          const inner = Math.max(40, st.getNoteEndX() - st.getNoteStartX() - 8);
+          try {
+            new VF.Formatter().joinVoices(r.voices).format(r.voices, inner);
+          } catch (_) {
+            r.voices.forEach(v => { try {
+              new VF.Formatter().joinVoices([v]).format([v], inner);
+            } catch (_) {} });
+          }
+          // Beams must exist BEFORE the notes are drawn: constructing a Beam is
+          // what tells its notes to drop their flags. Drawing first left every
+          // beamed note carrying a flag as well.
+          //
+          // Pass the WHOLE voice, rests included. generateBeams walks the array
+          // adding up durations to find the beat boundaries, so handing it a
+          // rest-free list moves every note earlier than it really is: a bar of
+          // an eighth rest plus seven eighths beamed as 3 pairs and one loose
+          // flagged note at the end, instead of by beat. `beam_rests: false`
+          // still keeps rests out of the beams themselves.
+          const beams = [];
+          r.voices.forEach(v => {
+            try {
+              const bo = { groups: beamGroups, beam_rests: false };
+              if (v._dir !== null) {
+                bo.stem_direction = v._dir;
+                bo.maintain_stem_directions = true;
+              }
+              VF.Beam.generateBeams(v.getTickables(), bo)
+                .forEach(bm => beams.push(bm));
+            } catch (_) {}
+          });
+          r.voices.forEach(v => { try { v.draw(ctx, st); } catch (_) {} });
+          beams.forEach(bm => { try { bm.setContext(ctx).draw(); } catch (_) {} });
+          r.tuplets.forEach(t => { try { t.setContext(ctx).draw(); } catch (_) {} });
+          r.ties.forEach(pr => { try {
+            new VF.StaveTie({ first_note: pr[0], last_note: pr[1],
+              first_indices: [0], last_indices: [0] }).setContext(ctx).draw();
+          } catch (_) {} });
+          // Where the formatter actually put each tick. The playhead reads this
+          // instead of spreading time evenly, because a run of 16ths gets far
+          // less width per beat than a whole note does.
+          r.voices.forEach(v => {
+            let t = 0;
+            v.getTickables().forEach(n => {
+              let ax = null;
+              try { ax = n.getAbsoluteX(); } catch (_) {}
+              if (ax !== null) marks.push([t, ax]);
+              t += (n._ev && n._ev.dur) || 0;
             });
-            if (e.notes.some(nn => nn.conf !== undefined && nn.conf < 0.5))
-              n.setStyle({ fillStyle: '#c85f3b', strokeStyle: '#c85f3b' });
-          }
-          if (e.dots) VF.Dot.buildAndAttach([n], { all: true });
-          n._ev = e;
-          vf.push(n);
-        });
-        if (!vf.length) return;
-        const voice = new VF.Voice({ num_beats: doc.time_sig[0], beat_value: doc.time_sig[1] })
-          .setMode(VF.Voice.Mode.SOFT);
-        voice.addTickables(vf);
-        voices.push(voice);
-        // tuplet brackets
-        let i = 0;
-        while (i < vf.length) {
-          if (!vf[i]._ev.tuplet) { i++; continue; }
-          let j = i;
-          while (j + 1 < vf.length && vf[j + 1]._ev.tuplet
-                 && !vf[j]._ev.tuplet_stop) j++;
-          const grp = vf.slice(i, j + 1);
-          if (grp.length > 1) {
-            const t = vf[i]._ev.tuplet;
-            try { allTuplets.push(new VF.Tuplet(grp, { num_notes: t[0], notes_occupied: t[1] })); } catch (_) {}
-          }
-          i = j + 1;
+          });
         }
-        // ties inside the measure
-        for (let k = 0; k + 1 < vf.length; k++) {
-          const a = vf[k]._ev, b = vf[k + 1]._ev;
-          if (a.notes && a.notes.length && a.notes[0].tie_start
-              && b.notes && b.notes.length && b.notes[0].tie_stop)
-            allTies.push([vf[k], vf[k + 1]]);
-        }
+        if (nStaves(p) === 2) braces.push([staves[first], staves[first + 1]]);
       });
-      if (!voices.length) return;
-      const pad = col === 0 ? (keyName !== 'C' ? 108 : 66) : 18;
-      try {
-        new VF.Formatter().joinVoices(voices).format(voices, Math.max(36, sw - pad));
-      } catch (_) {
-        voices.forEach(v => { try { new VF.Formatter().joinVoices([v]).format([v], Math.max(36, sw - pad)); } catch (_) {} });
-      }
-      voices.forEach(v => { try { v.draw(ctx, st); } catch (_) {} });
-      voices.forEach(v => {
-        try {
-          VF.Beam.generateBeams(v.getTickables().filter(z => !z.isRest() && !z._ev.tuplet))
-            .forEach(b => b.setContext(ctx).draw());
-        } catch (_) {}
-      });
-      allTuplets.forEach(t => { try { t.setContext(ctx).draw(); } catch (_) {} });
-      allTies.forEach(pr => { try {
-        new VF.StaveTie({ first_note: pr[0], last_note: pr[1], first_indices: [0], last_indices: [0] })
-          .setContext(ctx).draw(); } catch (_) {} });
-    });
 
-    const notesX = col === 0 ? (keyName !== 'C' ? x + 106 : x + 64) : x + 12;
-    const [tStart, tEnd] = measureTime(mi);
-    Score._layout.push({
-      x: notesX, w: Math.max(20, x + sw - 8 - notesX),
-      y: sysY - 6, h: parts.length * partH + 12,
-      tStart, tEnd,
+      const x0 = staves[0].getNoteStartX(), x1 = staves[0].getNoteEndX();
+      marks.push([0, x0], [b.tpm, x1]);
+      marks.sort((a, z) => a[0] - z[0] || a[1] - z[1]);
+      const uniq = [];
+      marks.forEach(m => {
+        const last = uniq[uniq.length - 1];
+        if (last && last[0] === m[0]) return;                     // first x wins
+        if (last && m[1] <= last[1]) return;                      // keep monotone
+        if (m[1] < x0 || m[1] > x1) return;                       // inside the bar
+        uniq.push(m);
+      });
+      const [tStart, tEnd] = measureTime(mi);
+      Score._layout.push({
+        x: x0, w: Math.max(20, x1 - x0),
+        y: sysY - 6, h: totalStaves * staffH + 12,
+        tpm: b.tpm, marks: uniq, tStart, tEnd,
+      });
+
+      if (col === 0) {
+        braces.forEach(pr => { try {
+          new VF.StaveConnector(pr[0], pr[1]).setType(VF.StaveConnector.type.BRACE)
+            .setContext(ctx).draw();
+        } catch (_) {} });
+        if (staves.length > 1) {
+          try {
+            if (parts.length > 1)
+              new VF.StaveConnector(staves[0], staves[staves.length - 1])
+                .setType(VF.StaveConnector.type.BRACKET).setContext(ctx).draw();
+            new VF.StaveConnector(staves[0], staves[staves.length - 1])
+              .setType(VF.StaveConnector.type.SINGLE_LEFT).setContext(ctx).draw();
+          } catch (_) {}
+        }
+      }
+      x += sw;
     });
-    if (col === 0 && staves.length > 1) {
-      try {
-        new VF.StaveConnector(staves[0], staves[staves.length - 1])
-          .setType(VF.StaveConnector.type.BRACKET).setContext(ctx).draw();
-        new VF.StaveConnector(staves[0], staves[staves.length - 1])
-          .setType(VF.StaveConnector.type.SINGLE_LEFT).setContext(ctx).draw();
-      } catch (_) {}
+  });
+  bindScoreSeek();
+}
+
+// x of a tick inside a laid-out measure, from where the formatter really drew
+// the notes. Falls back to an even spread when a measure produced no marks.
+function measureX(m, tick) {
+  const ms = m.marks;
+  if (!ms || ms.length < 2) return m.x + Math.max(0, Math.min(1, tick / (m.tpm || 1))) * m.w;
+  if (tick <= ms[0][0]) return ms[0][1];
+  for (let i = 1; i < ms.length; i++) {
+    if (tick <= ms[i][0]) {
+      const [t0, xa] = ms[i - 1], [t1, xb] = ms[i];
+      return t1 === t0 ? xb : xa + (tick - t0) / (t1 - t0) * (xb - xa);
     }
   }
+  return ms[ms.length - 1][1];
+}
+
+// time -> {measure, x} over the current layout, and back again
+function scoreXAt(t) {
+  const L = Score._layout;
+  if (!L || !L.length) return null;
+  let m = L.find(z => t >= z.tStart && t < z.tEnd);
+  if (!m) {
+    if (t < L[0].tStart) m = L[0];
+    else if (t >= L[L.length - 1].tEnd) m = L[L.length - 1];
+    else return null;
+  }
+  const span = m.tEnd - m.tStart || 1;
+  const frac = Math.max(0, Math.min(1, (t - m.tStart) / span));
+  // The legacy editor renderer records no tick marks; spread evenly there.
+  return { m, x: m.marks ? measureX(m, frac * (m.tpm || 1)) : m.x + frac * m.w };
+}
+
+// The inverse of measureX: which tick sits under this x. Both read the same
+// marks, so clicking where the playhead stands seeks back to the same instant.
+function measureTick(m, px) {
+  const ms = m.marks;
+  const tpm = m.tpm || 1;
+  if (!ms || ms.length < 2)
+    return Math.max(0, Math.min(1, (px - m.x) / (m.w || 1))) * tpm;
+  if (px <= ms[0][1]) return ms[0][0];
+  for (let i = 1; i < ms.length; i++) {
+    if (px <= ms[i][1]) {
+      const [t0, xa] = ms[i - 1], [t1, xb] = ms[i];
+      return xb === xa ? t1 : t0 + (px - xa) / (xb - xa) * (t1 - t0);
+    }
+  }
+  return ms[ms.length - 1][0];
+}
+
+function scoreTimeAt(px, py) {
+  const L = Score._layout;
+  if (!L || !L.length) return null;
+  const rows = L.filter(z => py >= z.y && py <= z.y + z.h);
+  const cand = rows.length ? rows : L;
+  let best = null;
+  for (const m of cand) {
+    const d = px < m.x ? m.x - px : px > m.x + m.w ? px - (m.x + m.w) : 0;
+    if (best === null || d < best.d) best = { d, m };
+  }
+  if (!best) return null;
+  const m = best.m;
+  const frac = Math.max(0, Math.min(1, measureTick(m, px) / (m.tpm || 1)));
+  return m.tStart + frac * (m.tEnd - m.tStart);
 }
 
 function fifthsToKey(f) {
@@ -933,102 +1234,6 @@ async function fetchScoreDoc(jobId, params) {
   const r = await fetch(`api/score/${jobId}?` + q.toString());
   if (!r.ok) throw new Error((await r.json()).detail || ('HTTP ' + r.status));
   return r.json();
-}
-
-// --- full multi-instrument score (one staff per part, stacked into systems) --
-function renderFullScore(box, parts, opts) {
-  Score._layout = [];
-  if (!window.Vex) { box.innerHTML = '<p class="hint" style="padding:20px">악보 렌더러 로드 실패</p>'; return; }
-  const VF = Vex.Flow;
-  const tempo = opts.tempo || 120, num = opts.num || 4, den = opts.den || 4;
-  const keyName = opts.keyName && KEYSIG[opts.keyName] ? opts.keyName : 'C';
-  const showKey = keyName !== 'C';
-  const P = (parts || []).filter(p => p.notes && p.notes.length);
-  if (!P.length) { box.innerHTML = '<p class="hint" style="padding:20px">표시할 음표가 없습니다.</p>'; return; }
-
-  const built = P.map(p => buildMeasures(p.notes, tempo, num, den));
-  const sec16 = (60 / (tempo || 120)) / 4;
-  const upm0 = built[0].upm;
-  const CAP = 300;
-  const nMeas = Math.min(CAP, Math.max(...built.map(b => b.measures.length)));
-  const cw = (($('#fullScore') || box).clientWidth) || 1000;
-  const W = Math.max(720, Math.min(cw, 1600));
-  const partH = 96, sysGap = 36, labelW = 104, margin = 16;
-  const per = Math.max(1, Math.min(6, Math.floor((W - margin * 2 - labelW) / 200)));
-  const sw = Math.floor((W - margin * 2 - labelW) / per);
-  const systems = Math.ceil(nMeas / per);
-  const H = systems * (P.length * partH + sysGap) + 30;
-
-  box.innerHTML = '';
-  const renderer = new VF.Renderer(box, VF.Renderer.Backends.SVG);
-  renderer.resize(W, H);
-  const ctx = renderer.getContext();
-  ctx.setFont('Arial', 9);
-
-  for (let mi = 0; mi < nMeas; mi++) {
-    const sys = Math.floor(mi / per), col = mi % per;
-    const x = margin + labelW + col * sw;
-    const sysY = 16 + sys * (P.length * partH + sysGap);
-    const staves = [];
-    P.forEach((part, pi) => {
-      const b = built[pi];
-      const segs = b.measures[mi] || [[null, b.upm]];
-      const y = sysY + pi * partH;
-      const st = new VF.Stave(x, y, sw);
-      if (col === 0) { st.addClef(b.clef); if (showKey) st.addKeySignature(keyName); }
-      if (mi === 0) st.addTimeSignature(num + '/' + den);
-      st.setContext(ctx).draw();
-      staves.push(st);
-      if (col === 0 && part.label) {
-        try {
-          ctx.save();
-          ctx.setFont('Arial', 10);
-          ctx.fillText(part.label.slice(0, 12), 6, y + partH * 0.42);
-          ctx.restore();
-        } catch (_) {}
-      }
-
-      const vf = [], ties = [];
-      segs.forEach(([pitch, len]) => {
-        decompose(len).forEach(([code, dots], ci, arr) => {
-          let n;
-          if (pitch === null) {
-            n = new VF.StaveNote({ clef: b.clef, keys: [b.clef === 'bass' ? 'd/3' : 'b/4'], duration: code + 'r' });
-          } else {
-            const sp = spell(pitch, keyName);
-            n = new VF.StaveNote({ clef: b.clef, keys: [sp.vexKey], duration: code });
-            if (sp.acc) n.addModifier(new VF.Accidental(sp.acc), 0);
-          }
-          if (dots) VF.Dot.buildAndAttach([n], { all: true });
-          vf.push(n);
-          if (pitch !== null && arr.length > 1 && ci > 0) ties.push([vf[vf.length - 2], n]);
-        });
-      });
-      const voice = new VF.Voice({ num_beats: num, beat_value: den }).setMode(VF.Voice.Mode.SOFT);
-      voice.addTickables(vf);
-      const pad = col === 0 ? (showKey ? 108 : 66) : 18;
-      new VF.Formatter().joinVoices([voice]).format([voice], Math.max(36, sw - pad));
-      voice.draw(ctx, st);
-      try { VF.Beam.generateBeams(vf.filter(z => !z.isRest())).forEach(bm => bm.setContext(ctx).draw()); } catch (_) {}
-      ties.forEach(pr => new VF.StaveTie({ first_note: pr[0], last_note: pr[1], first_indices: [0], last_indices: [0] }).setContext(ctx).draw());
-    });
-    {
-      const notesX = col === 0 ? (showKey ? x + 106 : x + 64) : x + 12;
-      Score._layout.push({
-        x: notesX, w: Math.max(20, x + sw - 8 - notesX),
-        y: sysY - 6, h: P.length * partH + 12,
-        tStart: mi * upm0 * sec16, tEnd: (mi + 1) * upm0 * sec16,
-      });
-    }
-    if (col === 0 && staves.length > 1) {
-      try {
-        new VF.StaveConnector(staves[0], staves[staves.length - 1]).setType(VF.StaveConnector.type.BRACKET).setContext(ctx).draw();
-        new VF.StaveConnector(staves[0], staves[staves.length - 1]).setType(VF.StaveConnector.type.SINGLE_LEFT).setContext(ctx).draw();
-      } catch (_) {}
-    }
-  }
-  if (Math.max(...built.map(b => b.measures.length)) > CAP)
-    box.insertAdjacentHTML('beforeend', '<p class="hint" style="padding:6px">앞 ' + CAP + '마디만 표시</p>');
 }
 
 // ===================== interactive piano-roll editor ===================
@@ -1329,7 +1534,7 @@ _on('#edRedo', 'click', () => Editor.doRedo());
 _on('#edRevert', 'click', () => Editor.revert());
 _on('#saveScore', 'click', () => Editor.post());
 _on('#keySel', 'change', () => { if (CUR) Score.render(CUR); });
-_on('#tsSel', 'change', () => { if (CUR) Score.render(CUR); if (Editor.cur) Editor.postSoon(); });
+_on('#tsSel', 'change', () => { TS_TOUCHED = true; if (CUR) Score.render(CUR); if (Editor.cur) Editor.postSoon(); });
 _on('#scoreTempo', 'input', () => { TEMPO_TOUCHED = true; if (CUR) { CUR.tempo = curTempo(); Score.render(CUR); } });
 _on('#scoreTempo', 'change', () => { if (Editor.cur) Editor.postSoon(); });
 _on('#json', 'click', () => {

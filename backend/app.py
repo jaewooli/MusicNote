@@ -449,10 +449,16 @@ def _mt3_stems(job_id: str, raw: list[dict], sensitivity: float,
 
 
 def _assemble_mt3(job_id: str, stems_out: list[dict], audio_dur: float,
-                  model: str, tempo: float, beats: list | None = None) -> dict:
+                  model: str, tempo: float, beats: list | None = None,
+                  met: dict | None = None) -> dict:
     notes, contour = _merge_stems(stems_out)
     beats = beats or []
+    met = met or {}
+    ts = tuple(met.get("time_sig") or (4, 4))
     return {
+        "time_sig": [int(ts[0]), int(ts[1])],
+        "downbeats": met.get("downbeats") or [],
+        "meter_confidence": met.get("confidence", 0.0),
         "engine": f"mt3:{model}",
         "mode": "mt3",
         "duration": round(audio_dur, 3),
@@ -512,20 +518,34 @@ def _mt3_pipeline(job_id: str, src_path: Path, audio_dur: float,
         JOBS.get(job_id, {})["mt3_raw"] = raw
         JOBS.get(job_id, {})["mt3_review"] = review
         JOBS.get(job_id, {})["mt3_model"] = out.get("model", "mr_mt3")
-        try:
-            import librosa
-            y, sr = librosa.load(str(src_path), sr=22050, mono=True)
-            beats, tempo = T._beat_grid(y, sr)
-        except Exception:
-            beats, tempo = [], 0.0
+        # Metre comes from the transcription, not from the audio. librosa reads
+        # a spectral-flux onset envelope, which on eval/refs_meter got the tempo
+        # right 10 times in 13 but produced beat F1 0.818, no downbeat at all,
+        # and no time signature. meter.detect() works from the notes MT3 just
+        # found (onset F1 0.958): beat F1 0.868, downbeat F1 0.592, and the time
+        # signature right 10 times in 13 instead of being hardcoded to 4/4.
+        import meter as MET
+        met = MET.detect(raw)
+        if not met.get("beats"):
+            try:                       # too few notes to find a pulse in
+                import librosa
+                y, sr = librosa.load(str(src_path), sr=22050, mono=True)
+                b, tp = T._beat_grid(y, sr)
+                met = {"tempo": tp, "beats": b, "downbeats": [],
+                       "time_sig": (4, 4), "confidence": 0.0}
+            except Exception:
+                met = {"tempo": 0.0, "beats": [], "downbeats": [],
+                       "time_sig": (4, 4), "confidence": 0.0}
+        tempo, beats = met.get("tempo", 0.0), met.get("beats", [])
         JOBS.get(job_id, {})["mt3_tempo"] = tempo
         JOBS.get(job_id, {})["mt3_beats"] = beats
+        JOBS.get(job_id, {})["mt3_meter"] = met
         _phase(dl_steps + 2, "assemble", "악기별·성부별(1st/2nd) 정리 중…", 5.0)
         JOBS.get(job_id, {})["mt3_split_voices"] = True
         JOBS.get(job_id, {})["mt3_max_voices"] = None
         stems_out = _mt3_stems(job_id, raw, T.DEFAULT_SENSITIVITY)
         result = _assemble_mt3(job_id, stems_out, audio_dur,
-                               out.get("model", "mr_mt3"), tempo, beats)
+                               out.get("model", "mr_mt3"), tempo, beats, met)
         # Validation is advisory: it surfaces likely misses but never invents
         # notes in the delivered score without a user review.
         result["validation"] = Q.audit(str(src_path), stems_out, result["notes"],
@@ -764,7 +784,7 @@ def refine(job_id: str,
                                    split_voices=sv, max_voices=mv)
             res = _assemble_mt3(job_id, stems_out, j["result"].get("duration", 0.0),
                                 j.get("mt3_model", "mr_mt3"), j.get("mt3_tempo", 0.0),
-                                j.get("mt3_beats", []))
+                                j.get("mt3_beats", []), j.get("mt3_meter"))
         except Exception as e:  # noqa: BLE001
             raise HTTPException(422, f"재분석 실패: {e}")
         prev = j["result"]
@@ -969,10 +989,14 @@ def _score_parts(res: dict, stem: Optional[str] = None) -> list[dict]:
 
 @app.get("/api/score/{job_id}")
 def score(job_id: str, stem: Optional[str] = None,
-          num: int = 4, den: int = 4, tempo: Optional[float] = None,
-          fifths: Optional[int] = None) -> dict:
+          num: Optional[int] = None, den: Optional[int] = None,
+          tempo: Optional[float] = None, fifths: Optional[int] = None) -> dict:
     """The ScoreDoc as JSON — the single notation source the browser renders,
-    so screen and MusicXML can no longer drift apart."""
+    so screen and MusicXML can no longer drift apart.
+
+    `num`/`den` omitted means the detected time signature (see meter.detect);
+    passing them is the editor overriding it. They used to default to 4/4, which
+    drew every 3/4 and 6/8 piece in four."""
     j = JOBS.get(job_id)
     if j is None or j.get("status") != "done":
         raise HTTPException(404, "이 작업은 만료되었거나 없습니다.")
@@ -980,6 +1004,9 @@ def score(job_id: str, stem: Optional[str] = None,
     res = j["result"]
     from dataclasses import asdict
     from score_build import build_score
+    ts_det = res.get("time_sig") or [4, 4]
+    num = int(num) if num else int(ts_det[0])
+    den = int(den) if den else int(ts_det[1])
     tmp = float(tempo or res.get("tempo") or 120.0)
     bts = res.get("beats") or None
     if bts and abs(float(res.get("tempo") or 0) - tmp) > 1.0:
@@ -987,6 +1014,10 @@ def score(job_id: str, stem: Optional[str] = None,
     try:
         doc = build_score(_score_parts(res, stem),
                           beats=bts,
+                          # Detected downbeats decide where the barlines go.
+                          # They are only valid alongside the beats they came
+                          # from, so an overridden tempo drops both.
+                          downbeats=(res.get("downbeats") or None) if bts else None,
                           tempo=tmp,
                           time_sig=(int(num), int(den)),
                           title=res.get("filename") or "MusicNote",

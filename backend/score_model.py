@@ -92,6 +92,9 @@ class Measure:
 class Voice:
     number: int
     measures: list[Measure] = field(default_factory=list)
+    # Which staff of the part this voice is printed on (1 = top). A keyboard
+    # part spanning both hands prints on two staves; everything else on one.
+    staff: int = 1
 
 
 @dataclass
@@ -102,6 +105,10 @@ class Part:
     is_drum: bool = False
     clef: str = "treble"
     voices: list[Voice] = field(default_factory=list)
+    # One clef per staff, top to bottom. `clef` stays as the top staff's clef
+    # so older consumers keep working.
+    staves: int = 1
+    clefs: list[str] = field(default_factory=lambda: ["treble"])
 
 
 @dataclass

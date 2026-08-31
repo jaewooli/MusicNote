@@ -7,6 +7,20 @@ from __future__ import annotations
 
 from statistics import median
 
+# How much of the shorter line's attacks must land on the other line's before
+# the pair counts as rhythmically chordal. 0.72 demanded near-perfect agreement,
+# which no arpeggio or sustained harmony ever reaches.
+ATTACK_RATIO = 0.62
+# Two lines with no attack agreement are still one chord if they sound together
+# for this share of the shorter one's sounding time.
+SUSTAIN_FRACTION = 0.55
+# ... and hold a roughly fixed interval while doing so (semitones, weighted SD).
+# Above this they are moving independently, which is counterpoint, not a chord.
+SUSTAIN_SPREAD = 3.5
+# Beyond an octave apart, two lines are separate registers (bass vs melody)
+# however well their rhythm agrees.
+MAX_CHORD_SPAN = 12
+
 
 def poly_fraction(notes: list[dict]) -> float:
     """Fraction of notes that overlap in time with at least one other note."""
@@ -174,6 +188,44 @@ def _aligned_pairs(a: list[dict], b: list[dict], tolerance: float) -> list[tuple
     return pairs
 
 
+def _sustain_overlap(a: list[dict], b: list[dict]) -> tuple[float, float, float]:
+    """How much two lines simply *ring together* -> (fraction, mean, spread).
+
+    The onset test below can only see lines that attack together. A held chord,
+    or a broken one whose tones enter one after another and then sustain, never
+    passes it — which is why a sustained harmony kept being advertised as one
+    new sequence per chord tone. Sounding together for most of their length is
+    the other kind of evidence that two lines are one chord.
+
+    `fraction` is shared sounding time over the shorter line's own sounding
+    time; `mean`/`spread` describe the vertical interval, weighted by how long
+    each pairing actually sounds.
+    """
+    dur_a = sum(float(n["end"]) - float(n["start"]) for n in a)
+    dur_b = sum(float(n["end"]) - float(n["start"]) for n in b)
+    if dur_a <= 0 or dur_b <= 0:
+        return 0.0, 0.0, 0.0
+    shared, wsum, samples = 0.0, 0.0, []
+    j = 0
+    for x in a:
+        xs, xe = float(x["start"]), float(x["end"])
+        while j < len(b) and float(b[j]["end"]) <= xs:
+            j += 1
+        k = j
+        while k < len(b) and float(b[k]["start"]) < xe:
+            ov = min(xe, float(b[k]["end"])) - max(xs, float(b[k]["start"]))
+            if ov > 0:
+                shared += ov
+                wsum += ov
+                samples.append((ov, int(b[k]["pitch"]) - int(x["pitch"])))
+            k += 1
+    if not samples or wsum <= 0:
+        return 0.0, 0.0, 0.0
+    mean = sum(w * d for w, d in samples) / wsum
+    spread = (sum(w * (d - mean) ** 2 for w, d in samples) / wsum) ** 0.5
+    return shared / min(dur_a, dur_b), mean, spread
+
+
 def _chord_verdict(a: list[dict], b: list[dict],
                    tolerance: float) -> tuple[float | None, bool]:
     """Judge whether two lines behave as one chordal pattern.
@@ -194,17 +246,29 @@ def _chord_verdict(a: list[dict], b: list[dict],
     never passes: the lines need repeated shared attacks and a stable interval.
     """
     pairs = _aligned_pairs(a, b, tolerance)
-    if len(pairs) < 2 or len(pairs) / min(len(a), len(b)) < 0.72:
+    ratio = len(pairs) / min(len(a), len(b))
+    if len(pairs) >= 2 and ratio >= ATTACK_RATIO:
+        intervals = [int(right["pitch"]) - int(left["pitch"]) for left, right in pairs]
+        centre = sum(intervals) / len(intervals)
+        spread = sum((x - centre) ** 2 for x in intervals) / len(intervals)
+        # Notes more than an octave apart are normally separate registers (bass
+        # / melody), even when their rhythm happens to coincide.
+        if abs(centre) > MAX_CHORD_SPAN or spread > 1.25 ** 2:
+            return None, True
+        # Prefer the most stable interval and the most complete alignment.
+        return spread + (1.0 - ratio) * 2.0, False
+
+    # No usable attack evidence. Two lines that sound together for most of their
+    # length are still one chord — a pad, or a broken chord left ringing.
+    frac, mean, spread = _sustain_overlap(a, b)
+    if frac < SUSTAIN_FRACTION:
         return None, False
-    intervals = [int(right["pitch"]) - int(left["pitch"]) for left, right in pairs]
-    centre = sum(intervals) / len(intervals)
-    spread = sum((x - centre) ** 2 for x in intervals) / len(intervals)
-    # Notes more than an octave apart are normally separate registers (bass /
-    # melody), even when their rhythm happens to coincide.
-    if abs(centre) > 12 or spread > 1.25 ** 2:
+    if abs(mean) > MAX_CHORD_SPAN:
         return None, True
-    # Prefer the most stable interval and the most complete rhythmic alignment.
-    return spread + (1.0 - len(pairs) / min(len(a), len(b))) * 2.0, False
+    if spread > SUSTAIN_SPREAD:
+        return None, False        # they move against each other: independent
+    # Ranked below any attack-aligned merge, so real chords still win first.
+    return 1.5 + spread * 0.5 + (1.0 - frac) * 2.0, False
 
 
 def _parallel_chord_score(a: list[dict], b: list[dict], tolerance: float) -> float | None:
