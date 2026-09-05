@@ -29,6 +29,7 @@ import fetch
 import mt3_bridge as MT3
 import mt3_ensemble as ME
 import mt3_post as MP
+import muscriptor_bridge as MU
 import musicxml as MX
 import quality as Q
 import stems as S
@@ -202,6 +203,39 @@ BASS_RESCUE_SEMITONES = (None if BASS_RESCUE_ENV is None else
                          (int(BASS_RESCUE_ENV) if BASS_RESCUE_ENV.strip() else None))
 BASS_RESCUE_ON_GPU = 7
 BASS_RESCUE_CUTOFF = int(os.environ.get("MUSICNOTE_MT3_BASS_RESCUE_CUTOFF", "36"))
+# A second rescue, keyed on TIMBRE rather than register. Measured on
+# eval/refs_band by splitting recall against the reference MIDI's own GM
+# instrument, not by pitch: acoustic instruments (piano, acoustic bass) recall
+# 84.2% through the shipped ensemble (YourMT3 + shifted runs + octave
+# correction); electric/synth instruments recall only 37.8% -- AND THE GAP
+# HOLDS WITHIN THE SAME REGISTER, so it is not the low-register blind spot
+# above, it is a separate one: MT3 was not trained to recognise these timbres
+# well, at any pitch. No pitch shift or ensemble vote fixes a model not
+# knowing what an instrument sounds like.
+#
+# MuScriptor (Kyutai + Mirelo, arXiv 2607.08168) labels its own output by
+# timbre (its vocabulary distinguishes acoustic_bass/electric_bass,
+# clean/distorted_electric_guitar, synth_lead/synth_pad...) and was measured
+# on the same 8 clips, single pass, no ensemble, no post-processing:
+#
+#   family          YourMT3 ensemble (shipped)   MuScriptor small (single pass)
+#   acoustic                84.2%                        91.9%
+#   electric/synth          37.8%                        65.8%
+#
+# Both axes improve -- not a trade-off -- so below, notes MuScriptor tagged
+# with one of these labels are trusted on their own (never touching the
+# families YourMT3 already covers well) exactly like the register-gated bass
+# rescue above: the base ensemble was never able to vote on what it could not
+# recognise, so disagreement there is not evidence against a note.
+#
+# MuScriptor separately regresses hard on solo material (mean note F1 0.74 vs
+# our 0.92-0.99) and its bundled beat tracker is worse than meter.detect() at
+# rhythm (7/13 refs_meter clips failed outright) -- see ACCURACY.md 2026-09-05.
+# So this stays a narrow, timbre-gated addition, not a wholesale replacement.
+MUSCRIPTOR_TIMBRES = frozenset(
+    os.environ.get("MUSICNOTE_MUSCRIPTOR_TIMBRES",
+                   "electric_bass,organ,synth_lead,synth_pad,tuba").split(","))
+MUSCRIPTOR_RESCUE = os.environ.get("MUSICNOTE_MUSCRIPTOR_RESCUE", "1") == "1"
 # Runs a note must appear in to be delivered. 1 = union (keep everything, review
 # only the disagreements); 2 = vote. Notes below the threshold are not deleted —
 # they become review candidates the user can accept.
@@ -707,6 +741,43 @@ def _mt3_bass_rescue(rescue_notes: list[dict], accepted: list[dict],
     return extra
 
 
+def _muscriptor_timbre_rescue(wav_path: str, accepted: list[dict],
+                              total_runs: int) -> list[dict]:
+    """Pull in notes from instrument families YourMT3 was never trained to
+    recognise well, regardless of register (see MUSCRIPTOR_TIMBRES above).
+
+    Guarded like every other extra pass in this pipeline: a MuScriptor failure
+    (worker down, timeout, bad audio) must not lose the transcription already
+    in hand, so this returns an empty list rather than raising.
+    """
+    if not MUSCRIPTOR_RESCUE:
+        return []
+    try:
+        if not MU.available():
+            return []
+        out = MU.transcribe(wav_path)
+    except Exception as e:  # noqa: BLE001
+        print(f"muscriptor timbre rescue skipped: {e}", flush=True)
+        return []
+    have: dict[int, list[float]] = {}
+    for n in accepted:
+        if not n.get("is_drum"):
+            have.setdefault(int(n["pitch"]), []).append(float(n["start"]))
+    extra = []
+    for n in out.get("notes") or []:
+        if n.get("instrument") not in MUSCRIPTOR_TIMBRES:
+            continue
+        starts = have.get(int(n["pitch"]), ())
+        if any(abs(s - float(n["start"])) <= 0.05 for s in starts):
+            continue
+        extra.append({"start": float(n["start"]), "end": float(n["end"]),
+                      "pitch": int(n["pitch"]), "velocity": int(n.get("velocity", 100)),
+                      "track": int(n.get("track", 0)), "program": int(n.get("program", 0)),
+                      "is_drum": False, "agreement": total_runs, "runs": [],
+                      "source": "muscriptor", "instrument": n["instrument"]})
+    return extra
+
+
 def _mt3_dynamics(raw: list[dict], wav_path: str) -> None:
     """Stamp every MT3 note with a real loudness (``dyn``) and a 10-point
     amplitude envelope (``env``), read from the audio's constant-Q transform.
@@ -978,6 +1049,16 @@ def _mt3_pipeline(job_id: str, src_path: Path, audio_dur: float,
                 print(f"mt3 bass rescue: +{len(extra)} notes below "
                       f"{BASS_RESCUE_CUTOFF} ({rescue_semis:+d} semitones)",
                       flush=True)
+        # Same idea, keyed on timbre instead of register: a MuScriptor pass is
+        # cheap (near real-time on CPU, unlike the extra MT3 passes above), so
+        # it is not GPU-gated.
+        timbre_extra = _muscriptor_timbre_rescue(str(src_path), raw, len(runs))
+        if timbre_extra:
+            merged.extend(timbre_extra)
+            raw = raw + timbre_extra
+            print(f"muscriptor timbre rescue: +{len(timbre_extra)} notes "
+                  f"({sorted(set(n['instrument'] for n in timbre_extra))})",
+                  flush=True)
         _mt3_dynamics(merged, str(src_path))
         JOBS.get(job_id, {})["mt3_raw"] = merged
         JOBS.get(job_id, {})["mt3_runs"] = len(runs)

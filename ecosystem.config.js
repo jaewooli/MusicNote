@@ -81,6 +81,36 @@ module.exports = {
     },
 
     {
+      // MuScriptor timbre-rescue worker. Runs in its OWN venv (~/muscriptor-venv,
+      // a different torch than mt3-infer needs) as a pm2 app, same reason as
+      // mt3-worker. Optional: app._muscriptor_timbre_rescue degrades to a no-op
+      // when this is down (see MUSICNOTE_MUSCRIPTOR_RESCUE).
+      //
+      // 'small' only — see ACCURACY.md 2026-09-05: medium/large cost far more
+      // (4x+ compute; large OOM-killed itself at 8.8 GB RSS on this 11 GB box,
+      // sharing it with several other unrelated services) for no consistent
+      // accuracy gain over small on the exact axis this rescue targets.
+      name: 'muscriptor-worker',
+      script: path.join(process.env.HOME || '/home/ubuntu', 'muscriptor-venv/bin/python3'),
+      args: path.join(ROOT, 'backend/muscriptor_worker.py'),
+      interpreter: 'none',
+      autorestart: true,
+      max_restarts: 10,
+      kill_timeout: 10000,
+      max_memory_restart: '2500M',
+      env: {
+        PYTHONUNBUFFERED: '1',
+        MUSCRIPTOR_MODEL: 'small',
+        MUSCRIPTOR_PORT: '8733',
+        MUSCRIPTOR_IDLE_UNLOAD: '600',
+      },
+      out_file: path.join(ROOT, 'logs/muscriptor.out.log'),
+      error_file: path.join(ROOT, 'logs/muscriptor.err.log'),
+      merge_logs: true,
+      time: true,
+    },
+
+    {
       // bgutil PO-token provider — companion service for yt-dlp / YouTube.
       // Needs Node >= 22 (private copy under ~/.local, see deploy/bgutil-pot.sh).
       name: 'bgutil-pot',
