@@ -28,6 +28,8 @@ eval/refs_band/*.muscriptor.json
 # staged by deploy/vast/build.sh, never committed (700 MB of model weights)
 deploy/vast/checkpoints/
 
-# written by deploy/vast/gpu.sh — the rented GPU worker's URL and instance id
+# written by deploy/vast/gpu.sh — the rented GPU worker's URL, instance id,
+# and auto-release deadline
 deploy/vast/current-url
 deploy/vast/current-instance
+deploy/vast/stop-at
