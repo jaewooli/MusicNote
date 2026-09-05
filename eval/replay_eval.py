@@ -65,13 +65,18 @@ def est_notes(caches: list[Path], sensitivity: float, split_voices: bool,
             k: (report[k] + rep[k] if isinstance(rep[k], int) else rep[k]) for k in rep}
         runs.append([{"start": float(n["start"]), "end": float(n["end"]),
                       "pitch": int(n["pitch"]), "velocity": int(n["velocity"]),
-                      "track": int(n["track"])} for n in kept])
+                      "track": int(n["track"]),
+                      "is_drum": bool(n.get("is_drum", False))} for n in kept])
 
     merged = E.merge(runs)
     accepted, review = E.split(merged, len(runs), min_agreement)
 
+    # The references list pitched notes only (`ref_notes` skips drum tracks),
+    # so drum hits must not count against precision here either.
     by_track: dict[int, list[dict]] = {}
     for n in accepted:
+        if n.get("is_drum"):
+            continue
         by_track.setdefault(n["track"], []).append(dict(n))
 
     out = []

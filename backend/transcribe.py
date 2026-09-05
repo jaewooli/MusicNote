@@ -762,20 +762,28 @@ def _salience_ratio(n: dict, sal: dict) -> float:
 _ENV_PTS = 10   # per-note amplitude-envelope samples
 
 
-def _note_dynamics(notes: list[dict], a: dict) -> list[dict]:
+def _note_dynamics(notes: list[dict], a: dict, field: str = "velocity",
+                   override: bool | None = None) -> list[dict]:
     """Give every note a real loudness + a per-note amplitude envelope, read from
     its OWN constant-Q rows (fundamental + 2·3rd harmonics) so simultaneous notes
-    stay separated. ``velocity`` becomes relative loudness; ``env`` is a 10-point
+    stay separated. ``field`` becomes relative loudness; ``env`` is a 10-point
     0-127 shape (own-peak normalised) → the player renders decay / swell / accent
     instead of a flat tone. Melody engines (fake velocity 90) get a full
-    override; polyphonic engines keep a blend of the model's own velocity."""
+    override; polyphonic engines keep a blend of the model's own velocity.
+
+    ``field`` exists because the MT3 path must not overwrite ``velocity``: that
+    field is what mt3_post.gate() thresholds on, so writing a real loudness into
+    it would silently turn the sensitivity slider into a "delete quiet notes"
+    control. MT3 notes get the measurement in ``dyn`` instead, and ``override``
+    forces a full replacement because MT3's own velocity is the constant 100 and
+    carries nothing to blend with."""
     sal = a.get("_sal")
     if not sal or not notes:
         return notes
     try:
         C, ct = sal["C"], sal["t"]
         nb, nf = C.shape
-        is_mel = a.get("kind") == "melody"
+        is_mel = (a.get("kind") == "melody") if override is None else bool(override)
         segs, peaks = [], []
         for n in notes:
             i0 = min(int(np.searchsorted(ct, n["start"])), nf - 1)
@@ -792,8 +800,8 @@ def _note_dynamics(notes: list[dict], a: dict) -> list[dict]:
         for n, seg, pk in zip(notes, segs, peaks):
             loud = (pk / gpeak) ** 0.5                          # perceptual-ish
             v_meas = int(max(6, min(127, round(16 + 111 * loud))))
-            cur = int(n.get("velocity", 90))
-            n["velocity"] = v_meas if is_mel else int(round(0.6 * v_meas + 0.4 * cur))
+            cur = int(n.get(field, n.get("velocity", 90)))
+            n[field] = v_meas if is_mel else int(round(0.6 * v_meas + 0.4 * cur))
             m = seg.max() or 1.0
             xs = np.linspace(0.0, 1.0, seg.size) if seg.size > 1 else np.array([0.0, 1.0])
             ys = (seg / m) if seg.size > 1 else np.array([1.0, 1.0])

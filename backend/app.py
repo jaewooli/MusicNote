@@ -13,6 +13,7 @@ mode "stems": Demucs 로 악기군별 스템 분리 후 각 스템을 채보 (�
 """
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -65,26 +66,240 @@ app = FastAPI(title="MusicNote", version="0.3.0")
 
 # job_id -> dict(status, stage, pct, message, [result], [error], [http], created)
 JOBS: dict[str, dict] = {}
+# Absolute paths of source audio that a running job still needs. _cleanup()
+# skips these; entries are added when a job takes ownership of a file and
+# removed in _run_job's finally.
+_IN_FLIGHT: set[str] = set()
 _JOB_SLOTS = threading.Semaphore(MAX_JOBS)
 _STEMS_SLOT = threading.Semaphore(1)   # Demucs is heavy: one at a time
 # MT3 and Demucs both peak RAM hard — an MT3 job also holds _STEMS_SLOT so they
 # can never run together on this box.
 _MT3_SLOT = threading.Semaphore(1)
 
-# Seconds of silent lead-in for the second MT3 pass. YourMT3's segment is
-# 2.048 s, so a half segment (1.024) moves every boundary to a segment centre.
-# 0 disables the second pass and with it the omission review queue.
-ENSEMBLE_SHIFT = float(os.environ.get("MUSICNOTE_MT3_ENSEMBLE_SHIFT", "1.024"))
+# Seconds of silent lead-in for each extra MT3 pass. YourMT3 reads
+# non-overlapping 2.048 s segments, so an attack landing on a boundary can be
+# dropped entirely; shifting the lead-in moves every boundary somewhere else.
+# The quarter-segment offsets below put each boundary at a different place in
+# all four runs. Empty disables the ensemble and with it the review queue.
+#
+# This used to be a single 1.024 s pass unioned with the base run. Measured
+# against the reference MIDI on both eval sets (eval/replay_eval.py machinery,
+# onset within 50 ms and same pitch):
+#
+#                                   solo piano          band
+#                                  P     R    F1     P     R    F1
+#   single run                   0.971 0.913 0.941  0.718 0.575 0.639
+#   0,1024 union   (was shipped) 0.949 0.944 0.946  0.598 0.676 0.635
+#   0,512,1024,1536 union        0.919 0.951 0.935  0.463 0.738 0.569
+#   0,512,1024,1536 agree>=2     0.965 0.937 0.951  0.762 0.599 0.671
+#   0,512,1024,1536 agree>=3     0.989 0.922 0.954  0.868 0.480 0.618
+#
+# Two things this says. Union was actively harmful on band material — worse
+# than not running an ensemble at all (0.635 vs 0.639), because every extra run
+# contributes its own false positives and nothing filters them. And the earlier
+# "union beats vote" result was not wrong, it was measured on solo piano only,
+# where the model is accurate enough that a second opinion is nearly free.
+#
+# Four runs at agreement 2 is the only configuration that improves BOTH sets.
+# agree>=3 wins on solo piano and collapses on band, so it is not the default.
+# The top of the band sweep is a plateau (0.667-0.674 across 4-6 runs at about
+# half agreement), so evenly spaced quarters is a point on the plateau rather
+# than a value fitted to these eight clips.
+#
+# Cost is four model passes instead of two. On the GPU worker that is seconds;
+# on the CPU fallback it doubles an already long wait.
+# Re-picked after mt3_ensemble._key stopped keying on the track, which changed
+# the agreement distribution the previous choice was made under. Three runs now
+# match four on F1 for both sets while printing fewer wrong notes:
+#
+#                          밴드 P     R     F1  |  솔로 P     R     F1
+#   0,512,1024,1536 (4실행) 0.737 0.633 0.681  | 0.965 0.937 0.951
+#   0,1024,1536     (3실행) 0.787 0.600 0.681  | 0.976 0.930 0.952
+#
+# The tie is broken on precision and cost. In a score a wrong note is visible as
+# a wrong note, while a missing one only shows against the audio, and three
+# passes is 25% less inference — which matters on the CPU fallback, where each
+# pass runs at roughly 8x the clip length.
+ENSEMBLE_SHIFTS = tuple(
+    float(x) for x in os.environ.get(
+        "MUSICNOTE_MT3_ENSEMBLE_SHIFTS", "1.024,1.536").split(",") if x.strip())
+# Extra passes on a RESAMPLED copy, in semitones. Resampling moves pitch and
+# tempo together by an exact factor, so it is perfectly invertible; the model is
+# asked the same music in another register, through different segment
+# boundaries, with no spectral damage. (Time-stretching is the obvious
+# alternative and is much worse: on band00 a 0.8x librosa stretch held onsets up
+# but dropped note F1 from 0.600 to 0.363, because the phase vocoder smears the
+# harmonic structure the pitch decoder reads.)
+#
+# Measured over the 8 band clips, as a FOURTH run added to the three shifts
+# above, at agreement 2 — with a control, because a fourth run of any kind also
+# relaxes the vote from 2-of-3 to 2-of-4:
+#
+#   fourth run          onset F1   note F1   +offset F1   notes
+#   none (3 shifts)       0.829     0.688      0.618       421
+#   another shift (512)   0.841     0.692      0.620       472
+#   another shift (768)   0.846     0.688      0.614       481
+#   +1 semitone           0.846     0.702      0.628       472
+#
+# A fourth SHIFT buys +0.004 and +0.000 — the shifted ensemble is saturated,
+# which matches the earlier "8 runs ~ 3 runs" result. The same inference spent
+# on a transposed run buys +0.014 at the same note count, because the shifted
+# runs are strongly correlated with each other and this one is not. On its own
+# the transposed run is a peer of the base run (mean note F1 0.657 vs 0.649).
+#
+# It composes with the octave correction rather than overlapping it — the
+# correction repairs notes already found (precision), the transposed run finds
+# notes the shifted runs missed (recall), and recall is what binds now:
+#
+#   octave fix  transpose      P       R      F1
+#       -           -        0.781   0.634   0.688
+#       -           yes      0.749   0.676   0.702
+#       yes         -        0.817   0.671   0.725
+#       yes         yes      0.779   0.709   0.734
+#
+# Default: ON where the pass is cheap, OFF where it is not. A GPU pass is
+# seconds; the CPU fallback runs at roughly 8x the clip length, so a fourth pass
+# there turns a 40 minute wait into 53. Accuracy is worth a lot but not that.
+# Set the env var to a semitone list to force it either way ("" disables).
+_TRANSPOSE_ENV = os.environ.get("MUSICNOTE_MT3_ENSEMBLE_TRANSPOSE")
+ENSEMBLE_TRANSPOSE = (None if _TRANSPOSE_ENV is None else
+                      tuple(int(x) for x in _TRANSPOSE_ENV.split(",") if x.strip()))
+ENSEMBLE_TRANSPOSE_ON_GPU = (1,)
+# A dedicated pass for the register the ensemble above cannot fix by voting.
+# Recall by octave on the band clips: C1-B1 (24-35) 6.1%, C2-B2 66.3%, C3-B3
+# 64.9%, C4-B4 89.6% (home register), C5-B5 65.7%. A real note below MIDI 36
+# gets at most ONE vote from every run in ENSEMBLE_SHIFTS/ENSEMBLE_TRANSPOSE —
+# they are all deaf down there together — so agreement>=2 throws it away
+# whether or not it is correct. Voting cannot fix a blind spot every voter
+# shares.
+#
+# The fix is not to vote harder but to trust a different witness: a pass
+# resampled UP moves that register into the model's home range (24-35 becomes
+# 36-47), and below the cutoff its answer is taken alone instead of counted.
+# Above the cutoff it is not consulted at all — the base ensemble is already
+# good there and the transposed pass has been pushed out of ITS home register.
+#
+# Swept +12 and +7 semitones against cutoffs 36/42/48/54/60 on eval/refs_band,
+# on top of the shifted ensemble + octave correction:
+#
+#   semitones   cutoff    P       R      F1   notes added
+#       -         -     0.809   0.730   0.766        0
+#      +7        <36    0.800   0.764   0.779      110
+#      +7        <42    0.788   0.766   0.774      142
+#      +7        <48    0.758   0.776   0.764      247
+#     +12        <36    0.803   0.744   0.770       51
+#     +12        <42    0.790   0.748   0.766       85
+#
+# +7 beat +12 at every cutoff (a smaller shift keeps more of the note's own
+# harmonic content intact), and 36 is the best cutoff by a clear margin — past
+# it the added recall stops being worth the precision it costs. On the solo
+# set the same transposed pass is worse than the base run at every clip
+# (mean note F1 0.917 vs 0.939) — solo piano's bass is already in range, so
+# this pass is not run there at all: it costs a whole extra inference for a
+# cutoff that rarely has a note under it.
+BASS_RESCUE_ENV = os.environ.get("MUSICNOTE_MT3_BASS_RESCUE")
+BASS_RESCUE_SEMITONES = (None if BASS_RESCUE_ENV is None else
+                         (int(BASS_RESCUE_ENV) if BASS_RESCUE_ENV.strip() else None))
+BASS_RESCUE_ON_GPU = 7
+BASS_RESCUE_CUTOFF = int(os.environ.get("MUSICNOTE_MT3_BASS_RESCUE_CUTOFF", "36"))
 # Runs a note must appear in to be delivered. 1 = union (keep everything, review
-# only the disagreements); 2 = vote (higher precision, notes seen once become
-# review candidates instead of being delivered).
-MIN_AGREEMENT = int(os.environ.get("MUSICNOTE_MT3_MIN_AGREEMENT", "1"))
+# only the disagreements); 2 = vote. Notes below the threshold are not deleted —
+# they become review candidates the user can accept.
+MIN_AGREEMENT = int(os.environ.get("MUSICNOTE_MT3_MIN_AGREEMENT", "2"))
+
+
+# Job state that survives a restart. Everything here is plain JSON; the numpy
+# analysis caches (`analysis`, `stem_analyses`, `_sal`, model outputs) are
+# deliberately left out — they exist only to make a refine fast, they are large,
+# and a restored job falls back to the same "cannot be re-tuned" path an expired
+# one already used. `mt3_raw` IS kept, so an MT3 job stays fully re-tunable
+# across a restart, which is the case that actually mattered.
+_PERSIST_KEYS = (
+    "status", "stage", "pct", "message", "created", "mode", "http", "error",
+    "result", "mt3_raw", "mt3_review", "mt3_model", "mt3_tempo", "mt3_beats",
+    "mt3_meter", "mt3_split_voices", "mt3_max_voices", "mt3_runs",
+    "mix_beats", "mix_tempo",
+)
+
+
+def _jsonable(o):
+    """numpy scalars/arrays leak into results from the analysis stages."""
+    if hasattr(o, "tolist"):
+        return o.tolist()
+    if hasattr(o, "item"):
+        return o.item()
+    raise TypeError(f"not JSON serialisable: {type(o).__name__}")
+
+
+def _persist(job_id: str) -> None:
+    """Snapshot a finished job to {job_id}.job.json.
+
+    Results used to live only in memory, so any backend restart — including a
+    deploy — silently threw away whatever the user was looking at. The file goes
+    in WORK_DIR under the job id so that _cleanup() expires it and _keep_alive()
+    refreshes it with the job's other files, on the same TTL, with no separate
+    lifetime to keep in sync.
+
+    Only finished jobs are written: a running job's worker thread does not
+    survive the restart, so persisting one would restore a job that can never
+    make progress.
+    """
+    j = JOBS.get(job_id)
+    if not j or j.get("status") == "running":
+        return
+    snap = {k: j[k] for k in _PERSIST_KEYS if k in j}
+    path = WORK_DIR / f"{job_id}.job.json"
+    tmp = path.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(snap, default=_jsonable, ensure_ascii=False),
+                       encoding="utf-8")
+        os.replace(tmp, path)          # atomic: a reader never sees a half file
+    except (OSError, TypeError, ValueError) as e:  # noqa: BLE001
+        print(f"job {job_id[:8]} not persisted: {e}", flush=True)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _restore() -> None:
+    """Reload persisted jobs at startup, skipping any past their TTL.
+
+    Age comes from the file's mtime rather than the `created` field inside it,
+    because _keep_alive() extends a job's life by touching its files. Reading
+    the field instead would expire a job the user is actively working on.
+    """
+    now = time.time()
+    n = 0
+    for path in WORK_DIR.glob("*.job.json"):
+        jid = path.name[:-len(".job.json")]
+        try:
+            if now - path.stat().st_mtime > RESULT_TTL:
+                continue
+            snap = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if jid not in JOBS:
+            snap["created"] = path.stat().st_mtime
+            JOBS[jid] = snap
+            n += 1
+    if n:
+        print(f"restored {n} job(s) from disk", flush=True)
 
 
 def _cleanup() -> None:
     now = time.time()
+    busy = set(_IN_FLIGHT)
     for p in WORK_DIR.glob("*"):
         try:
+            # Never reap a file a running job is still reading. Age alone is not
+            # enough: a long upload plus a slow four-pass transcription can
+            # outlive RESULT_TTL, and then the next submission deletes the
+            # source out from under the job that is mid-inference. The symptom
+            # is remote, so it reads as a worker fault:
+            #   mt3 remote backend failed (FileNotFoundError: ...uploads/x.wav)
+            if str(p) in busy:
+                continue
             if now - p.stat().st_mtime > RESULT_TTL:
                 p.unlink()
         except OSError:
@@ -377,8 +592,155 @@ def _note_spans(notes: list[dict], gap: float = 0.6, min_len: float = 0.4) -> li
     return [[round(a, 2), round(b, 2)] for a, b in spans if b - a >= min_len]
 
 
+# An octave correction only fires when the harmonic evidence for the other
+# register beats "leave it alone" by this factor, over a part with at least this
+# many notes. Both guards exist because a harmonic comb an octave DOWN also
+# covers the note itself (2nd harmonic), a fifth above it (3rd) and the octave
+# above (4th), so the lower template can explain everything the correct one does
+# plus more, and wins on raw activation. Taking the plain argmax scores WORSE
+# than doing nothing (0.613 vs 0.688 on the band clips).
+#
+# Swept over the 8 band clips. Every cell of ratio 2.0-3.5 x min-notes 20-60
+# gives the same 0.725 with two moves and none of them wrong, so this is the
+# middle of a plateau rather than a fitted point:
+#
+#   band clips   note F1        moves   wrong
+#   no correction  0.688          -       -
+#   plain argmax   0.613         14       9
+#   guarded        0.725          2       0
+#   oracle         0.732          -       -
+#
+# 84% of the oracle ceiling, for no extra inference. On the solo set it makes
+# ZERO moves and leaves F1 at 0.958 — solo piano has no systematic displacement,
+# and the guards correctly find nothing to do.
+OCTAVE_RATIO = float(os.environ.get("MUSICNOTE_MT3_OCTAVE_RATIO", "2.5"))
+OCTAVE_MIN_NOTES = int(os.environ.get("MUSICNOTE_MT3_OCTAVE_MIN_NOTES", "40"))
+
+
+def _mt3_octaves(raw: list[dict], wav_path: str) -> None:
+    """Move a whole part back into its own register when the audio says so.
+
+    MT3's largest single error on band material is octave DISPLACEMENT, and it
+    is systematic per instrument: on band03 the bass came back with 86.5% of its
+    104 notes a whole octave up. Because every run makes the same mistake, the
+    shifted-run vote cannot see it — and it is 28% of all matched notes, larger
+    than everything else in this pipeline put together.
+
+    The decision is taken once per part, from a harmonic-comb NMF: a template at
+    pitch p explains p, 2p, 3p..., so asking which of p-12 / p / p+12 the energy
+    really belongs to is exactly what that decomposition answers. A per-NOTE
+    version of this was tried first and lost F1; a whole part carries enough
+    evidence to be decided reliably, a single note does not.
+    """
+    try:
+        import numpy as np       # deferred like the rest of the heavy imports
+        y, sr = T.load_audio(wav_path)
+        sal = T._salience_cqt(y, sr)
+        nmf = T._harmonic_nmf(sal["C"], sal["t"]) if sal else None
+        if not nmf:
+            return
+        H, lo, t = nmf["H"], nmf["lo_midi"], nmf["t"]
+        by_track: dict[int, list[dict]] = {}
+        for n in raw:
+            if not n.get("is_drum"):     # a kit slot has no register to correct
+                by_track.setdefault(int(n.get("track", 0)), []).append(n)
+        for track, notes in by_track.items():
+            if len(notes) < OCTAVE_MIN_NOTES:
+                continue
+            support = {}
+            for d in (-12, 0, 12):
+                vals = []
+                for n in notes:
+                    r = int(n["pitch"]) + d - lo
+                    if not (0 <= r < H.shape[0]):
+                        vals.append(0.0)
+                        continue
+                    i0 = min(int(np.searchsorted(t, n["start"])), H.shape[1] - 1)
+                    i1 = min(max(i0 + 1, int(np.searchsorted(t, n["end"]))),
+                             H.shape[1])
+                    vals.append(float(H[r, i0:i1].mean()))
+                support[d] = float(np.mean(vals)) if vals else 0.0
+            stay = support[0]
+            best = max((-12, 12), key=lambda d: support[d])
+            if stay <= 0 or support[best] < OCTAVE_RATIO * stay:
+                continue
+            for n in notes:
+                n["pitch"] = int(n["pitch"]) + best
+            print(f"mt3 octave: track {track} ({len(notes)} notes) moved "
+                  f"{best:+d} (support {support[best]:.3f} vs {stay:.3f})",
+                  flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"mt3 octave correction skipped: {e}", flush=True)
+
+
+def _mt3_bass_rescue(rescue_notes: list[dict], accepted: list[dict],
+                      total_runs: int, cutoff: int = BASS_RESCUE_CUTOFF
+                      ) -> list[dict]:
+    """Pull in low notes the voting ensemble could never have accepted.
+
+    ``rescue_notes`` is a transposed-up pass, already mapped back to real
+    pitch and time by ``mt3_bridge._untranspose``. Below ``cutoff`` every run
+    in the shifted/semitone ensemble is close to deaf (see the measurement at
+    BASS_RESCUE_CUTOFF above), so a real note down there was never going to
+    reach agreement>=2 — not because the runs disagree, but because none of
+    them could supply a second vote. So below the cutoff this pass is trusted
+    on its own instead of counted; above it, nothing here is touched.
+
+    A rescued note is given ``agreement = total_runs`` so it survives the
+    sensitivity slider re-splitting at display time exactly like a note every
+    run agreed on — the alternative (agreement 1) would make the slider hide
+    it at the very setting most users leave the pipeline at.
+    """
+    have: dict[int, list[float]] = {}
+    for n in accepted:
+        if not n.get("is_drum"):
+            have.setdefault(int(n["pitch"]), []).append(float(n["start"]))
+    extra = []
+    for n in rescue_notes:
+        if n.get("is_drum") or int(n["pitch"]) >= cutoff:
+            continue
+        starts = have.get(int(n["pitch"]), ())
+        if any(abs(s - float(n["start"])) <= 0.05 for s in starts):
+            continue
+        extra.append({**n, "agreement": total_runs, "runs": [],
+                      "source": "bass_rescue"})
+    return extra
+
+
+def _mt3_dynamics(raw: list[dict], wav_path: str) -> None:
+    """Stamp every MT3 note with a real loudness (``dyn``) and a 10-point
+    amplitude envelope (``env``), read from the audio's constant-Q transform.
+
+    MT3 reports a constant velocity of 100 for every note it emits, so without
+    this every note in a transcription plays back at exactly the same level and
+    the result sounds mechanical. Measured on eval/refs_band, loudness read this
+    way does NOT tell a correct note from a wrong one (AUC 0.452, i.e. no better
+    than chance), so it is deliberately not fed into ``conf`` and never removes
+    anything — it only decides how loud a note is played.
+
+    Written to ``dyn``, not ``velocity``: mt3_post.gate() thresholds on
+    ``velocity``, and a real loudness there would turn the sensitivity slider
+    into a filter that deletes quiet notes. Done once per job so that a refine,
+    which re-runs the gate and the voice split, stays instant.
+    """
+    try:
+        y, sr = T.load_audio(wav_path)
+        sal = T._salience_cqt(y, sr)
+        if sal is None:
+            return
+        pitched = [n for n in raw if not n.get("is_drum")]
+        if pitched:
+            T._note_dynamics(pitched, {"_sal": sal}, field="dyn", override=True)
+        # Drum hits have no fundamental to read, so they keep a flat level.
+        for n in raw:
+            n.setdefault("dyn", int(n.get("velocity", 100)))
+    except Exception as e:  # noqa: BLE001
+        print(f"mt3 dynamics failed, playback stays flat: {e}", flush=True)
+
+
 def _mt3_stems(job_id: str, raw: list[dict], sensitivity: float,
-               split_voices: bool = True, max_voices: int | None = None) -> list[dict]:
+               split_voices: bool = True, max_voices: int | None = None,
+               runs: int = 1) -> list[dict]:
     """Group MT3 notes by model track and infer notation lines when needed.
 
     Polyphonic lines are inferred from actual overlap, pitch continuity and
@@ -386,20 +748,58 @@ def _mt3_stems(job_id: str, raw: list[dict], sensitivity: float,
     """
     s = max(0.0, min(1.0, sensitivity))
     kept, gate_report = MP.gate(raw, s)
-    if gate_report["dropped_length"] or gate_report["dropped_velocity"]:
+    # The ensemble vote is the real sensitivity control on this path; the
+    # velocity floor above cannot be, because YourMT3 pins velocity at 100.
+    need = MP.required_agreement(s, runs)
+    if runs > 1:
+        before = len(kept)
+        kept = [n for n in kept if int(n.get("agreement", runs)) >= need]
+        gate_report["agreement_floor"] = need
+        gate_report["dropped_agreement"] = before - len(kept)
+    if (gate_report["dropped_length"] or gate_report["dropped_velocity"]
+            or gate_report.get("dropped_agreement")):
         print(f"mt3 gate: {gate_report}", flush=True)
     by_track: dict[int, dict] = {}
     for n in kept:
-        t = n["track"]
+        # All percussion is one kit. MT3 can emit several drum tracks for the
+        # same performance — they are channel-10 events whose "program" is a
+        # guess, and the same guess we already know drifts between runs (see
+        # mt3_ensemble._key). Left separate they became two drum staves for one
+        # drummer, the second of which was 54% rests.
+        #
+        # Pitched tracks are NOT merged this way. Measured on eval/refs_band
+        # against the reference instrument labels, a small track is not a
+        # fragment of a big one: of tracks with 1-5 notes only 33% duplicate an
+        # instrument some larger track already carries, which is the same rate
+        # as tracks with 41+ notes (36%). Folding them together would erase a
+        # real part two times out of three.
+        # ... and pitched notes are grouped by the PROGRAM, not the track id.
+        # The track id is an arbitrary slot; the program is the instrument MT3
+        # named, and one track can carry several programs while two tracks can
+        # carry the same one — which printed two staves both labelled "패드 1".
+        # Measured on eval/refs_band against the reference instrument labels:
+        #   트랙 id     파트 53  라인 62  P 0.509  R 0.718  F1 0.596
+        #   프로그램     파트 54  라인 63  P 0.517  R 0.732  F1 0.606
+        t = -1 if n.get("is_drum") else int(n.get("program", 0))
         d = by_track.setdefault(t, {"program": n["program"], "is_drum": n["is_drum"], "notes": []})
         p = int(n["pitch"])
         d["notes"].append({
             "start": round(float(n["start"]), 3), "end": round(float(n["end"]), 3),
             "pitch": p, "name": T.midi_to_name(p),
             "freq": round(440.0 * 2 ** ((p - 69) / 12.0), 2),
-            "velocity": int(n["velocity"]),
-            "conf": round(0.55 + 0.4 * (n["velocity"] / 127.0), 2),
+            # `velocity` is the measured loudness where we have one; `conf` stays
+            # on the model's own value because loudness was measured not to
+            # predict correctness (see _mt3_dynamics).
+            "velocity": int(n.get("dyn", n["velocity"])),
+            # Real per-note confidence: how many shifted runs found this note.
+            # The old formula read MT3's velocity, which is the constant 100, so
+            # every note came out at 0.865 and the UI's uncertainty highlight
+            # was decorative. See mt3_post.confidence for the calibration.
+            "conf": MP.confidence(int(n.get("agreement", runs)), runs),
+            "agreement": int(n.get("agreement", runs)),
         })
+        if n.get("env"):
+            d["notes"][-1]["env"] = n["env"]
 
     stems: list[dict] = []
     for t, d in sorted(by_track.items()):
@@ -413,7 +813,7 @@ def _mt3_stems(job_id: str, raw: list[dict], sensitivity: float,
         # only when neighbouring onset groups establish independent sequences.
         groups: list[tuple[str, list[dict]]] = [("", d["notes"])]
         if split_voices and not d["is_drum"] and len(d["notes"]) >= 8:
-            if VO.poly_fraction(d["notes"]) >= 0.18:
+            if VO.poly_fraction(d["notes"]) >= VO.SPLIT_POLY_GATE:
                 parts = VO.separate_sequences(d["notes"])
                 if len(parts) > 1:
                     groups = [(f"시퀀스 {k + 1}", p) for k, p in enumerate(parts)]
@@ -485,37 +885,102 @@ def _mt3_pipeline(job_id: str, src_path: Path, audio_dur: float,
     if not _STEMS_SLOT.acquire(timeout=15) or not _MT3_SLOT.acquire(timeout=15):
         raise RuntimeError("다른 정밀 채보/분리 작업이 진행 중입니다. 잠시 후 다시 시도하세요.")
     try:
-        runs_wanted = 2 if ENSEMBLE_SHIFT > 0 else 1
-        _phase(dl_steps + 1, "mt3",
-               f"MT3 다악기 정밀 채보 중… (2-CPU 서버라 곡 길이의 약 {8 * runs_wanted}배 소요)",
-               max(30.0, audio_dur * 8.0 * runs_wanted))
+        # `on_gpu` is needed before the run count, because whether the
+        # transposed pass runs at all depends on it.
+        on_gpu = MT3.remote_url() is not None
+        transposes = (ENSEMBLE_TRANSPOSE if ENSEMBLE_TRANSPOSE is not None
+                      else (ENSEMBLE_TRANSPOSE_ON_GPU if on_gpu else ()))
+        rescue_semis = (BASS_RESCUE_SEMITONES if BASS_RESCUE_SEMITONES is not None
+                        else (BASS_RESCUE_ON_GPU if on_gpu else None))
+        runs_wanted = 1 + len(ENSEMBLE_SHIFTS) + len(transposes)
+        # The estimate has to follow the backend actually in use. A GPU worker
+        # runs about 3x faster than realtime; the local CPU fallback is ~8x
+        # slower than realtime, per pass. Quoting the CPU figure while a GPU is
+        # answering told the user to expect a 32x wait for a 40 s job.
+        per_run = 0.35 if on_gpu else 8.0
+        total_passes = runs_wanted + (1 if rescue_semis is not None else 0)
+        eta = max(20.0, audio_dur * per_run * total_passes)
+        where = "GPU 워커" if on_gpu else "2-CPU 서버라 곡 길이의 약 " \
+                                          f"{int(8 * total_passes)}배 소요"
+        _phase(dl_steps + 1, "mt3", f"MT3 다악기 정밀 채보 중… ({where})", eta)
         out = MT3.transcribe(str(src_path))
         raw = out.get("notes", [])
         if not raw:
             raise RuntimeError("MT3 가 음을 찾지 못했습니다.")
 
-        # Second pass at a half-segment offset. YourMT3 reads non-overlapping
-        # 2.048 s segments, so an attack on a boundary can be dropped; where the
-        # two runs disagree is where the model is unreliable. A failure here
-        # must not lose the transcription we already have.
+        # Extra passes at shifted segment boundaries. A failure in any of them
+        # must not lose the transcription we already have, so each is guarded
+        # and the run list simply ends up shorter.
         runs = [raw]
-        if ENSEMBLE_SHIFT > 0:
+        for k, shift in enumerate(ENSEMBLE_SHIFTS, start=2):
             _phase(dl_steps + 1, "mt3",
-                   "누락 검증용 2차 채보 중… (세그먼트 경계를 옮겨 재추론)",
-                   max(30.0, audio_dur * 8.0))
+                   f"누락 검증용 {k}/{runs_wanted}차 채보 중… "
+                   "(세그먼트 경계를 옮겨 재추론)",
+                   max(20.0, audio_dur * per_run))
             try:
-                shifted = MT3.transcribe(str(src_path), shift=ENSEMBLE_SHIFT)
+                shifted = MT3.transcribe(str(src_path), shift=shift)
                 if shifted.get("notes"):
                     runs.append(shifted["notes"])
             except Exception as e:  # noqa: BLE001
-                print(f"mt3 ensemble pass failed, using single run: {e}", flush=True)
+                print(f"mt3 ensemble pass at {shift}s failed: {e}", flush=True)
+
+        for j, semis in enumerate(transposes, start=2 + len(ENSEMBLE_SHIFTS)):
+            _phase(dl_steps + 1, "mt3",
+                   f"누락 검증용 {j}/{runs_wanted}차 채보 중… "
+                   "(음역을 옮겨 재추론)",
+                   max(20.0, audio_dur * per_run))
+            try:
+                moved = MT3.transcribe(str(src_path), semitones=semis)
+                if moved.get("notes"):
+                    runs.append(moved["notes"])
+            except Exception as e:  # noqa: BLE001
+                print(f"mt3 ensemble pass at {semis} semitones failed: {e}",
+                      flush=True)
+
+        # A further pass purely for the register no voting run can reach — see
+        # BASS_RESCUE_CUTOFF above. Not added to `runs`: it does not vote, it
+        # is trusted alone below the cutoff after the vote is already decided.
+        rescue_raw = None
+        if rescue_semis is not None:
+            _phase(dl_steps + 1, "mt3",
+                   f"{runs_wanted + 1}/{total_passes}차 베이스 보강 채보 중… "
+                   "(음역을 크게 올려 재추론)",
+                   max(20.0, audio_dur * per_run))
+            try:
+                moved = MT3.transcribe(str(src_path), semitones=rescue_semis)
+                rescue_raw = moved.get("notes") or None
+            except Exception as e:  # noqa: BLE001
+                print(f"mt3 bass rescue pass at {rescue_semis} semitones "
+                      f"failed: {e}", flush=True)
+
+        # Agreement is a fraction of the runs that actually returned, so losing
+        # a pass relaxes the threshold instead of silently rejecting good notes.
+        need = MIN_AGREEMENT if len(runs) == runs_wanted else max(
+            1, round(MIN_AGREEMENT * len(runs) / runs_wanted))
 
         merged = ME.merge(runs)
-        raw, review = ME.split(merged, len(runs), MIN_AGREEMENT)
+        raw, review = ME.split(merged, len(runs), need)
         if len(runs) > 1:
-            print(f"mt3 ensemble: runs={len(runs)} merged={len(merged)} "
-                  f"accepted={len(raw)} review={len(review)}", flush=True)
-        JOBS.get(job_id, {})["mt3_raw"] = raw
+            print(f"mt3 ensemble: runs={len(runs)} agree>={need} "
+                  f"merged={len(merged)} accepted={len(raw)} "
+                  f"review={len(review)}", flush=True)
+        # The whole merged list is kept, not just what the vote accepted, so
+        # the sensitivity slider can loosen as well as tighten without re-running
+        # the model. _mt3_stems applies the vote at display time.
+        # Before dynamics: a moved part must be at its real pitch before the
+        # loudness read looks for energy there.
+        _mt3_octaves(merged, str(src_path))
+        if rescue_raw:
+            extra = _mt3_bass_rescue(rescue_raw, raw, len(runs))
+            if extra:
+                merged.extend(extra)
+                raw = raw + extra
+                print(f"mt3 bass rescue: +{len(extra)} notes below "
+                      f"{BASS_RESCUE_CUTOFF} ({rescue_semis:+d} semitones)",
+                      flush=True)
+        _mt3_dynamics(merged, str(src_path))
+        JOBS.get(job_id, {})["mt3_raw"] = merged
+        JOBS.get(job_id, {})["mt3_runs"] = len(runs)
         JOBS.get(job_id, {})["mt3_review"] = review
         JOBS.get(job_id, {})["mt3_model"] = out.get("model", "mr_mt3")
         # Metre comes from the transcription, not from the audio. librosa reads
@@ -543,7 +1008,8 @@ def _mt3_pipeline(job_id: str, src_path: Path, audio_dur: float,
         _phase(dl_steps + 2, "assemble", "악기별·성부별(1st/2nd) 정리 중…", 5.0)
         JOBS.get(job_id, {})["mt3_split_voices"] = True
         JOBS.get(job_id, {})["mt3_max_voices"] = None
-        stems_out = _mt3_stems(job_id, raw, T.DEFAULT_SENSITIVITY)
+        stems_out = _mt3_stems(job_id, merged, T.DEFAULT_SENSITIVITY,
+                               runs=len(runs))
         result = _assemble_mt3(job_id, stems_out, audio_dur,
                                out.get("model", "mr_mt3"), tempo, beats, met)
         # Validation is advisory: it surfaces likely misses but never invents
@@ -567,6 +1033,7 @@ def _run_job(job_id: str, src: tuple, mode: str) -> None:
     # progress is PHASE-LOCAL: each named phase runs its own 0..100%. A ticker
     # eases the bar forward while a blocking call runs; real signals (download
     # byte hook) override it. `steps` = how many phases this job has.
+    owned = ""          # source path this job owns; see _IN_FLIGHT
     dl_steps = 1 if src[0] == "url" else 0
     # A complete arrangement needs joint multi-instrument transcription, not a
     # bag of notes from a generic polyphonic detector.  "polyphonic" is the
@@ -621,6 +1088,8 @@ def _run_job(job_id: str, src: tuple, mode: str) -> None:
             src_path = Path(src[1])
             source_name = src[2]
 
+        owned = str(src_path)         # src_path is set to None after the
+        _IN_FLIGHT.add(owned)         # rename, so keep the key separately
         audio_dur = _probe_duration(src_path) or 45.0
 
         if is_mt3:
@@ -675,6 +1144,8 @@ def _run_job(job_id: str, src: tuple, mode: str) -> None:
         _set(job_id, status="error", http=502, error=str(e), message=f"실패: {e}")
     finally:
         stop_tick.set()
+        _IN_FLIGHT.discard(owned)
+        _persist(job_id)
         _JOB_SLOTS.release()
         if src_path is not None:
             try:
@@ -781,7 +1252,8 @@ def refine(job_id: str,
         j["mt3_split_voices"], j["mt3_max_voices"] = sv, mv
         try:
             stems_out = _mt3_stems(job_id, j["mt3_raw"], s,
-                                   split_voices=sv, max_voices=mv)
+                                   split_voices=sv, max_voices=mv,
+                                   runs=int(j.get("mt3_runs", 1)))
             res = _assemble_mt3(job_id, stems_out, j["result"].get("duration", 0.0),
                                 j.get("mt3_model", "mr_mt3"), j.get("mt3_tempo", 0.0),
                                 j.get("mt3_beats", []), j.get("mt3_meter"))
@@ -793,6 +1265,7 @@ def refine(job_id: str,
         res["filename"] = prev.get("filename")
         res["note_count"] = len(res["notes"])
         j["result"] = res
+        _persist(job_id)
         return res
 
     cache = j.get("stem_analyses")
@@ -869,6 +1342,7 @@ def refine(job_id: str,
     res["note_count"] = len(res["notes"])
     res["filename"] = prev.get("filename")
     j["result"] = res
+    _persist(job_id)
     return res
 
 
@@ -941,6 +1415,7 @@ def edit(job_id: str,
     res["edited"] = True
     res["midi_url"] = f"/api/download/{job_id}.mid"
     res["musicxml_url"] = f"/api/download/{job_id}.musicxml"
+    _persist(job_id)
     return {
         "midi_url": res["midi_url"],
         "musicxml_url": res["musicxml_url"],
@@ -1067,4 +1542,8 @@ def audio(name: str) -> FileResponse:
 
 
 # static frontend (mounted last so /api/* wins)
+# Pick up any job that outlived the last process. Done at import, before the
+# first request, so a reload never briefly 404s a job that is on disk.
+_restore()
+
 app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="static")

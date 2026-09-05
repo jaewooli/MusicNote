@@ -1,0 +1,82 @@
+[
+ {
+  "ref": "band00",
+  "source": "7thsaga_bt1.mid",
+  "notes": {
+   "other": 129,
+   "bass": 143,
+   "piano": 235,
+   "drums": 274
+  }
+ },
+ {
+  "ref": "band01",
+  "source": "7thsaga_bt2.mid",
+  "notes": {
+   "piano": 147,
+   "other": 116,
+   "bass": 105,
+   "drums": 316
+  }
+ },
+ {
+  "ref": "band02",
+  "source": "7thsaga_town3-1.mid",
+  "notes": {
+   "other": 41,
+   "piano": 194,
+   "bass": 42,
+   "drums": 101
+  }
+ },
+ {
+  "ref": "band03",
+  "source": "B1L_pilotwings-rocketbelt.mid",
+  "notes": {
+   "piano": 232,
+   "other": 41,
+   "bass": 99,
+   "drums": 139
+  }
+ },
+ {
+  "ref": "band04",
+  "source": "Beach_Time.mid",
+  "notes": {
+   "other": 39,
+   "piano": 502,
+   "bass": 123,
+   "drums": 186
+  }
+ },
+ {
+  "ref": "band05",
+  "source": "CC_Chip_02-KM.mid",
+  "notes": {
+   "bass": 364,
+   "other": 204,
+   "piano": 274,
+   "drums": 182
+  }
+ },
+ {
+  "ref": "band06",
+  "source": "CSRobot.mid",
+  "notes": {
+   "drums": 277,
+   "other": 466,
+   "piano": 121,
+   "bass": 265
+  }
+ },
+ {
+  "ref": "band07",
+  "source": "Castlevania_4-Vampire_Killer.mid",
+  "notes": {
+   "other": 289,
+   "bass": 178,
+   "piano": 72,
+   "drums": 211
+  }
+ }
+]

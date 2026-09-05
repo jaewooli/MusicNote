@@ -16,6 +16,7 @@ import os
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 MT3_URL = os.environ.get("MUSICNOTE_MT3_URL", "http://127.0.0.1:8732").rstrip("/")
 # Where the fallback worker lives. Separate from MT3_URL so that when MT3_URL
@@ -29,6 +30,30 @@ LOCAL_URL = os.environ.get("MUSICNOTE_MT3_LOCAL_URL",
 #             cold start a scale-to-zero worker pays on every request.
 # "vast"   -> vast.ai serverless endpoint via the vastai SDK, audio uploaded.
 BACKEND = os.environ.get("MUSICNOTE_MT3_BACKEND", "local")
+# A rented GPU worker's URL, written by deploy/vast/gpu.sh. Read per request
+# rather than at import: switching the GPU on or off then costs nothing but a
+# file write, where restarting the app to pick up an environment variable would
+# throw away every job in JOBS, which lives only in memory.
+URL_FILE = os.environ.get(
+    "MUSICNOTE_MT3_URL_FILE",
+    str(Path(__file__).resolve().parent.parent / "deploy/vast/current-url"))
+_url_cache: dict = {"t": 0.0, "url": None}
+
+
+def remote_url(ttl: float = 2.0) -> str | None:
+    """The GPU worker to use right now, or None for the local CPU one."""
+    now = time.time()
+    if now - _url_cache["t"] < ttl:
+        return _url_cache["url"]
+    url = None
+    try:
+        text = Path(URL_FILE).read_text().strip()
+        if text.startswith("http"):
+            url = text.rstrip("/")
+    except OSError:
+        pass
+    _url_cache.update(t=now, url=url)
+    return url
 VAST_ENDPOINT = os.environ.get("MUSICNOTE_VAST_ENDPOINT", "musicnote-mt3")
 # Fall back to the local worker when the remote one fails, so a GPU outage
 # degrades to "slow" instead of "broken".
@@ -130,14 +155,72 @@ def _transcribe_vast(wav_path: str, model: str | None, shift: float,
     return out.get("response", out) if isinstance(out, dict) else out
 
 
+def _transposed_copy(wav_path: str, semitones: int, tmpdir) -> tuple[str, float]:
+    """A resampled copy `semitones` higher, and the time factor to undo it.
+
+    Resampling moves pitch and tempo together by exactly 2**(k/12), so the
+    transform is perfectly invertible — unlike time-stretching, which has to
+    reconstruct phase and smears the harmonic structure the pitch decoder
+    reads. Measured on band00, a 0.8x librosa stretch dropped note F1 from
+    0.600 to 0.363 while a semitone resample held it at 0.594.
+    """
+    import numpy as np
+    import soundfile as sf
+    import librosa
+
+    y, sr = sf.read(wav_path)
+    if getattr(y, "ndim", 1) > 1:
+        y = y.mean(axis=1)
+    y = np.asarray(y, dtype=np.float32)
+    if sr != 16000:
+        y = librosa.resample(y, orig_sr=sr, target_sr=16000)
+        sr = 16000
+    ratio = 2.0 ** (semitones / 12.0)
+    # Fewer samples at the same declared rate = faster and higher by `ratio`.
+    ys = librosa.resample(y, orig_sr=sr, target_sr=int(round(sr / ratio)))
+    out = str(Path(tmpdir) / f"transposed_{semitones}.wav")
+    sf.write(out, ys, sr)
+    return out, ratio
+
+
+def _untranspose(result: dict, semitones: int, ratio: float) -> dict:
+    """Put a transposed run's notes back on the original timeline and pitch."""
+    for n in result.get("notes") or []:
+        n["start"] = round(float(n["start"]) * ratio, 4)
+        n["end"] = round(float(n["end"]) * ratio, 4)
+        # A drum "pitch" is a GM kit slot, not a pitch. A resampled kick still
+        # sounds like a kick and comes back on the same slot, so subtracting the
+        # semitones there would rewrite the kit rather than undo anything.
+        if not n.get("is_drum"):
+            n["pitch"] = int(n["pitch"]) - semitones
+    if result.get("duration"):
+        result["duration"] = round(float(result["duration"]) * ratio, 2)
+    return result
+
+
 def transcribe(wav_path: str, model: str | None = None,
-               timeout: int = DEFAULT_TIMEOUT, shift: float = 0.0) -> dict:
+               timeout: int = DEFAULT_TIMEOUT, shift: float = 0.0,
+               semitones: int = 0) -> dict:
     """Transcribe via the configured backend.
 
     Returns {notes:[...], tracks:[...], model, seconds}. ``shift`` runs
     inference with that many seconds of silent lead-in; see
-    ``mt3_worker.transcribe``. Times come back on the original timeline.
+    ``mt3_worker.transcribe``. ``semitones`` runs it on a resampled copy in
+    another register and maps the result back. Times and pitches come back on
+    the original timeline either way.
+
+    The two ask genuinely different questions. Shifted runs see the same audio
+    through differently placed windows and are strongly correlated, so a fourth
+    shift is worth almost nothing (note F1 +0.004 and +0.000 for two different
+    offsets over 8 band clips). Spending that same pass on a transposed run is
+    worth +0.014 at the same note count.
     """
+    if semitones:
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            path, ratio = _transposed_copy(wav_path, semitones, td)
+            out = transcribe(path, model, timeout, shift)
+        return _untranspose(out, semitones, ratio)
     if BACKEND == "vast":
         try:
             return _transcribe_vast(wav_path, model, shift, timeout)
@@ -147,9 +230,10 @@ def transcribe(wav_path: str, model: str | None = None,
             print(f"mt3 remote backend failed ({type(e).__name__}: {e}); "
                   f"falling back to the local worker", flush=True)
 
-    if BACKEND == "remote":
+    gpu = remote_url() or (MT3_URL if BACKEND == "remote" else None)
+    if gpu:
         try:
-            return _post(MT3_URL, _payload(wav_path, model, shift, upload=True),
+            return _post(gpu, _payload(wav_path, model, shift, upload=True),
                          timeout)
         except Exception as e:  # noqa: BLE001  (box stopped, or still booting)
             if not REMOTE_FALLBACK:

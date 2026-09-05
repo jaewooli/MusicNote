@@ -147,6 +147,18 @@ def _as_candidate(note: dict) -> dict:
             "confirmed_by": "mt3-ensemble"}
 
 
+# Candidates the UI will draw as ghost notes on the piano roll. Four runs at
+# agreement 2 put roughly 680 notes per 25 s clip into the queue, which is more
+# events than the score itself has — an unusable overlay and a large payload.
+#
+# The cap is a plain time-ordered prefix because there is nothing better to sort
+# by. Measured over 6086 review notes on both eval sets, 11.6% of which are real
+# omissions: ranking by note length gives AUC 0.535, i.e. it does not rank at
+# all (the top 100 by length are 7.0% real, *below* the 11.6% base rate). If a
+# per-note confidence ever becomes available, sort by it here.
+MAX_REVIEW_CANDIDATES = int(os.environ.get("MUSICNOTE_MAX_REVIEW", "200"))
+
+
 def audit(path: str, stems: list[dict], notes: list[dict],
           ensemble_candidates: list[dict] | None = None,
           runs: int = 1) -> dict:
@@ -163,8 +175,12 @@ def audit(path: str, stems: list[dict], notes: list[dict],
     else:
         confirmed = [_as_candidate(n) for n in (ensemble_candidates or [])]
         confirmed.sort(key=lambda c: c["start"])
+    total = len(confirmed)
+    confirmed = confirmed[:MAX_REVIEW_CANDIDATES]
     return {"structural": structural, "missed_onset_candidates": missed,
             "confirmed_missing_notes": confirmed,
+            # the true size, so the UI never implies the list is complete
+            "confirmed_missing_total": total,
             "candidate_source": "cqt" if CQT_CANDIDATES else "mt3-ensemble",
             "ensemble_runs": int(runs),
             "status": "pass" if structural["passed"] else "fail"}

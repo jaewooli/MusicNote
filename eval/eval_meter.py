@@ -56,8 +56,12 @@ def detect(source: str, wav: Path, gt: dict) -> dict:
         import transcribe as T
         y, sr = librosa.load(str(wav), sr=22050, mono=True)
         beats, tempo = T._beat_grid(y, sr)
-        # Nothing in the current pipeline detects either of these: app.py's
-        # /api/score defaults to num=4, den=4, and no downbeat is ever found.
+        # This branch is the RETIRED librosa-only path, kept for comparison. It
+        # reports no downbeat and always 4/4 because it never detected either —
+        # the pipeline now runs `meter.detect` over the transcribed notes, which
+        # does both. Reading this branch as the product's meter accuracy makes
+        # it look far worse than it is: 6/13 time signatures and downbeat F1
+        # 0.000 here, against 10/13 and 0.592 on the real path.
         return {"tempo": tempo, "beats": beats, "downbeats": [], "time_sig": (4, 4)}
 
     import meter as M
@@ -78,7 +82,11 @@ def detect(source: str, wav: Path, gt: dict) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("refs", nargs="?", default="eval/refs_meter")
-    ap.add_argument("--source", choices=["audio", "midi", "mt3"], default="audio")
+    # "midi" by default: it runs the detector the product runs, on clean notes,
+    # so the number is the detector's own accuracy. "mt3" adds transcription
+    # error on top (and needs a cached run per clip); "audio" is the retired
+    # path and is kept only for comparison.
+    ap.add_argument("--source", choices=["midi", "mt3", "audio"], default="midi")
     a = ap.parse_args()
 
     refs = sorted(Path(a.refs).glob("*.meter.json"))
