@@ -100,3 +100,25 @@ def check_span(label, events, limit):
 # check it directly rather than only through group sizes.
 check_span("chord_span_within_octave",
            [(0, (48, 60, 72)), (.5, (50, 62, 74)), (1, (52, 64, 76))], 12)
+
+
+# Three genuinely separate, well-separated (in time and register) monophonic
+# lines used to come back as three equal-status "성부" — a real notation
+# reader sees a wall of staves, not a melody with an accompaniment. Past
+# MAX_SEQUENCE_PARTS, the busiest line (the melody) stays on its own and
+# everything else is folded into one accompaniment part.
+_melody_block = _held([(i * 0.2, (60 + (i % 5),)) for i in range(60)], hold=0.15)
+_low_block = _held([(20 + i * 0.2, (36,)) for i in range(24)], hold=0.15)
+_high_block = _held([(40 + i * 0.2, (84,)) for i in range(24)], hold=0.15)
+_parts = separate_sequences(_melody_block + _low_block + _high_block)
+assert len(_parts) == 2, ("more_than_two_sequences_collapse_to_two", len(_parts))
+assert sorted(len(p) for p in _parts) == [48, 60], \
+    ("melody_plus_accompaniment_sizes", sorted(len(p) for p in _parts))
+_melody_part = max(_parts, key=len)
+_accompaniment_part = min(_parts, key=len)
+assert {n["pitch"] for n in _melody_part} <= {60, 61, 62, 63, 64}, \
+    ("melody_part_is_the_busy_middle_line", sorted({n["pitch"] for n in _melody_part}))
+assert {n["pitch"] for n in _accompaniment_part} == {36, 84}, \
+    ("accompaniment_part_merges_the_rest", sorted({n["pitch"] for n in _accompaniment_part}))
+print("more_than_two_sequences_collapse_to_melody_plus_accompaniment: "
+      f"{sorted(len(p) for p in _parts)}")

@@ -399,6 +399,15 @@ SPLIT_POLY_GATE = 0.50
 # The share term bought two fewer lines and cost a fifth of the score.
 MIN_SEQUENCE_NOTES = 24
 
+# Each sequence becomes its own staff downstream (app._mt3_stems), so more
+# than a couple is not "more voices found" to a reader, it is a single
+# instrument's chord voicings fragmenting into a wall of near-identical
+# staves — a piano playing melody-plus-harmony coming back as five equal-
+# looking "성부" lines instead of a melody and an accompaniment. Real
+# notation for a polyphonic instrument tops out at two staves (a grand
+# staff) for exactly this reason.
+MAX_SEQUENCE_PARTS = 2
+
 
 def _absorb_slivers(parts: list[list[dict]], min_notes: int) -> list[list[dict]]:
     """Fold sequences too small to stand on their own into the largest one."""
@@ -505,8 +514,32 @@ def separate_sequences(notes: list[dict], chord_gap: float = 0.035,
     parts = _link_sequential([g for g in groups.values() if g])
     parts = _absorb_slivers(parts, min_notes)
     parts = [sorted(group, key=lambda n: (n["start"], n["pitch"])) for group in parts]
-    parts.sort(key=lambda part: -median(n["pitch"] for n in part))
+    if len(parts) > MAX_SEQUENCE_PARTS:
+        parts = _melody_plus_accompaniment(parts)
+    else:
+        parts.sort(key=lambda part: -median(n["pitch"] for n in part))
     return parts
+
+
+def _melody_plus_accompaniment(parts: list[list[dict]]) -> list[list[dict]]:
+    """Collapse 3+ inferred sequences to (the melody, everything else).
+
+    "The melody" is picked by note count first, register second: a moving
+    tune visits far more distinct pitches than a held chord or pad does even
+    when the pad happens to sit higher, so register alone (the previous
+    sort key) could and did put a static high pad in front of the actual
+    tune. This is a heuristic, not a melody detector — it will occasionally
+    pick a busy bassline over a sparse vocal line — but it is a better
+    default than "whichever is highest," and it caps what the score shows
+    as separate staves at two regardless of how many sequences the pairwise
+    chord/contour analysis above found.
+    """
+    lead = max(parts, key=lambda part: (len(part), median(n["pitch"] for n in part)))
+    rest = [n for part in parts if part is not lead for n in part]
+    out = [lead]
+    if rest:
+        out.append(sorted(rest, key=lambda n: (n["start"], n["pitch"])))
+    return out
 
 
 def separate_voices(notes: list[dict], max_voices: int | None = None,
