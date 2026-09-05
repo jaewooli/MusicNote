@@ -831,12 +831,20 @@ def drum_hit_profile(y: np.ndarray, sr: int, notes: list[dict],
                 cent = float(np.mean(librosa.feature.spectral_centroid(y=seg, sr=sr)))
             except Exception:
                 continue
-            rms = librosa.feature.rms(y=seg)[0]
+            # frame_length=512/hop_length=128 (~6ms) for a hit that can decay
+            # in under 50ms; center=False so frame 0 is the onset itself, not
+            # a padded window straddling silence before it — with the default
+            # center=True every hit measured decay_s as the exact same
+            # constant (the segment's own frame count), because frame 0's
+            # near-silent padding made "half of frame 0" a threshold nothing
+            # in the real hit ever fell back below.
+            rms = librosa.feature.rms(y=seg, frame_length=512, hop_length=128,
+                                      center=False)[0]
             if rms.size < 2 or rms[0] <= 1e-9:
                 continue
             below = np.where(rms <= rms[0] * 0.5)[0]
             decay_frames = int(below[0]) if below.size else rms.size
-            decays.append(decay_frames * 512 / sr)   # librosa.feature.rms default hop
+            decays.append(decay_frames * 128 / sr)
             centroids.append(cent)
         if centroids:
             out[str(pitch)] = {"centroid_hz": round(float(np.median(centroids)), 1),

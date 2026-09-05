@@ -446,20 +446,34 @@ const Player = {
     other:    { partials: [0, 1.00, 0.35, 0.16], gainDb: 0.0, attack: 0.004 },  // = the old single tone
   },
   _voiceFor(family) { return this.FAMILY_VOICE[family] || this.FAMILY_VOICE.other; },
-  // n.brightness (0..1): how much of THIS part's own energy sits in its
-  // 2nd-4th harmonics vs its fundamental, measured from this song's own audio
+  // n.brightness: how much of THIS part's own energy sits in its 2nd-4th
+  // harmonics vs its fundamental, measured from this song's own audio
   // (backend/transcribe.instrument_brightness) — a real per-song reading, not
-  // a fixed guess. 0.5 is left as the family's own unmodified partial shape
-  // (roughly where an untagged/average part sits); above or below that
-  // redistributes energy toward or away from the harmonics while holding the
+  // a fixed guess. NOT a 0..1 value in practice, despite the ratio it's built
+  // from: measured over 45 real (instrument, clip) parts across eval/refs_band
+  // and eval/refs, it clusters at 0.05-0.46 (median 0.21, IQR 0.17-0.25),
+  // never near the 1.0 a genuinely bright/noisy tone would need to reach. The
+  // first version of this used 0.5 as "the family's own unmodified shape" —
+  // for every real part measured, that silently roughly HALVED the harmonics
+  // of whatever family it was applied to (audible as "doesn't even sound
+  // like a piano anymore" and "the bass sounds off"), because 0.5 is not
+  // where real recordings actually sit. BRIGHTNESS_MID is that empirical
+  // median instead, so a typical part's own reading leaves its family's
+  // baseline alone; only a part unusually bright or dull relative to real
+  // recordings shifts it, and by less than before (the empirical spread is
+  // roughly 0.05 either side of the median in the IQR, not 0.5).
+  //
+  // Redistributes energy toward or away from the harmonics while holding the
   // partial stack's total amplitude constant, so brightness changes the
   // COLOUR of the tone, not its loudness (that's still vpk/gainDb/_tilt).
   // Undefined brightness (not measured, or a drum note) leaves the family's
   // own partials untouched.
+  BRIGHTNESS_MID: 0.21,
+  BRIGHTNESS_SCALE: 2.5,
   _partialsFor(family, brightness) {
     const base = this._voiceFor(family).partials;
     if (brightness == null) return base;
-    const scale = Math.max(0, 1 + (brightness - 0.5) * 1.6);
+    const scale = Math.max(0, 1 + (brightness - this.BRIGHTNESS_MID) * this.BRIGHTNESS_SCALE);
     const adj = base.map((a, i) => (i <= 1 ? a : a * scale));
     const baseTotal = base.reduce((s, a) => s + a, 0) || 1;
     const adjTotal = adj.reduce((s, a) => s + a, 0) || baseTotal;
@@ -573,12 +587,19 @@ const Player = {
       g.gain.exponentialRampToValueAtTime(1e-4, t0 + decay);
     };
     if (kind === 'kick') {
-      const start = this._clamp(cent, 90, 260, 150);
-      const end = this._clamp(cent != null ? cent * 0.28 : null, 32, 70, 42);
+      // The measured centroid is read from the FULL MIX at this hit's onset
+      // (MT3 mode has no isolated drum audio), so it runs well above what an
+      // isolated kick's own centroid would be — measured on real band mixes,
+      // 800-1900 Hz, not the 90-260 Hz an isolated kick's click would show.
+      // Used for the click's START only, clamped to that realistic range; the
+      // sub-bass END target stays a fixed constant regardless of the reading
+      // — that's what makes it read as a kick at all, and a mix-contaminated
+      // number has nothing reliable to say about it.
+      const start = this._clamp(cent, 150, 2000, 150);
       const decay = this._clamp(dec, 0.12, 0.4, 0.22);
       const o = ac.createOscillator(); o.type = 'sine';
       o.frequency.setValueAtTime(start, when);
-      o.frequency.exponentialRampToValueAtTime(end, when + 0.09);
+      o.frequency.exponentialRampToValueAtTime(42, when + 0.09);
       const g = ac.createGain(); env(g, 1.0, decay, 0);
       o.connect(g).connect(out); o.start(when); o.stop(when + decay + 0.08); this._osc.push(o);
     } else if (kind === 'snare') {
@@ -594,7 +615,10 @@ const Player = {
       o.connect(g2).connect(out); o.start(when); o.stop(when + decay * 0.6); this._osc.push(o);
     } else if (kind === 'hihat_closed' || kind === 'hihat_open' || kind === 'cymbal') {
       const fallbackDecay = kind === 'hihat_closed' ? 0.07 : kind === 'hihat_open' ? 0.35 : 1.1;
-      const hpFreq = this._clamp(cent, 3000, 10000, 6000);
+      // Same mix-contamination caveat as the kick above: measured on real
+      // band mixes, a hihat/cymbal onset's own centroid reads 1500-2900 Hz,
+      // not the 3000+ an isolated cymbal's shimmer would show.
+      const hpFreq = this._clamp(cent, 1500, 9000, 6000);
       const decay = this._clamp(dec, 0.04, 1.6, fallbackDecay);
       const src = noise(), hp = ac.createBiquadFilter();
       hp.type = 'highpass'; hp.frequency.value = hpFreq;
@@ -602,8 +626,13 @@ const Player = {
       src.connect(hp).connect(g).connect(out); src.start(when); src.stop(when + decay + 0.05);
       this._osc.push(src);
     } else if (kind === 'tom') {
-      const measured = this._clamp(cent, 90, 260, null);
-      const base = measured != null ? measured : 180 - Math.max(0, Math.min(24, n.pitch - 41)) * 4;
+      // No centroid override here (unlike kick/hihat above): a tom's real
+      // fundamental IS in roughly this 90-260 Hz range, but the mix-
+      // contaminated centroid read has no way to isolate it from everything
+      // else sounding at that instant, where it would for a genuinely
+      // broadband click/shimmer. The GM pitch is already a real, reliable
+      // proxy for which tom this is (high/mid/low) — trust that instead.
+      const base = 180 - Math.max(0, Math.min(24, n.pitch - 41)) * 4;
       const decay = this._clamp(dec, 0.15, 0.5, 0.28);
       const o = ac.createOscillator(); o.type = 'sine';
       o.frequency.setValueAtTime(base * 1.4, when);
