@@ -1957,3 +1957,47 @@ HF 게이트 인증은 pm2 의 `env` 블록이 아니라 `huggingface_hub.login(
 잘못 고를 수 있음), 그래도 "제일 높은 게 1성부"보다는 낫다.
 `eval/test_sequence_analysis.py` 에 3개 이상 시퀀스가 2개로 합쳐지는지,
 많이 움직이는 쪽이 선율로 남는지 검증하는 케이스 추가.
+
+## 2026-09-05 (이어서): 재생 음색을 이 곡 자체의 오디오에서 측정해 반영했다
+
+사용자 결정: 고정 프리셋이 아니라 **원곡 오디오에서 직접 잰 값**으로 합성을
+조정. `backend/transcribe.py` 에 두 측정 함수를 새로 추가했다 — Demucs
+스템 모드의 `classify_instrument` 와 같은 종류지만, MT3 모드는 스템이
+분리돼 있지 않고(전체 믹스 그대로) 악기 식별은 모델의 분류에 의존하므로,
+전체 클립을 훑는 대신 **이 파트가 실제로 소리 내는 순간**(그 음의 온셋)
+만 골라서 잰다:
+
+- `instrument_brightness(notes, sal)` — 이미 계산돼 있는 CQT salience 를
+  재사용해서, 한 파트의 음마다 기본음 대비 2~4배음 에너지 비율을 재고
+  중앙값을 낸다. `_mt3_octaves`/`_mt3_dynamics` 와 같은 근거: 동시에 다른
+  악기가 배음 관계의 음을 내면 섞여 들어갈 수 있어 완벽하진 않지만, 파트
+  전체에 걸쳐 중앙값을 내면 안정적이다.
+- `drum_hit_profile(y, sr, notes)` — 킥/스네어/하이햇 등 GM 키트 조각별로
+  실제 온셋 지점의 원본 오디오(0.15초 창)에서 스펙트럼 중심(밝기)과 RMS
+  반감 시간(감쇠)을 측정한다. CQT 가 아니라 원본 파형을 쓴다 — 드럼 히트는
+  대부분 노이즈라 피치 salience 맵이 잴 게 없다.
+
+`_mt3_dynamics`(다이내믹스를 재는 김에 오디오가 이미 로드돼 있어서 여기서
+같이 잰다)가 `(program, is_drum)` 파트별로 이 값들을 재서 `mt3_tone` 에
+저장하고(문자열 키 `_part_key` — 정수 키는 잡 영속화 JSON 왕복에서 문자열로
+바뀌어 버려서), `_mt3_stems` 가 스템을 만들 때 `instrument.features.
+brightness`/`drum_profile` 로 붙인다. `_tag_notes` 를 다시 확장해 음마다
+`brightness`(파트 전체 공통값) 또는 `drum_centroid`/`drum_decay`(그 음의
+GM 피치로 조회)를 싣는다.
+
+`frontend/musicnote-core.js`: `Player._partialsFor(family, brightness)` 가
+family 의 기본 배음 배열을 측정된 밝기로 재분배한다(총 진폭은 그대로 —
+음색만 바뀌고 음량은 안 바뀌게). `_waves()` 캐시 키에 밝기를 10단계로
+버킷해서 넣어 파트 하나가 풀 하나를 공유하게 했다. 드럼은
+`_drumVoice` 의 고정 상수(스윕 목표 주파수·밴드패스 중심·감쇠 시간)를
+`drum_centroid`/`drum_decay` 측정값으로 대체하고, 측정이 없으면(무음
+구간, 읽기 실패) 기존 고정값으로 되돌아간다 — 절대 소리가 안 나는 쪽으로
+실패하지 않는다.
+
+`eval/test_instrument_tone.py`(6개), `eval/test_note_tagging.py` 에 4개
+추가 — 배음이 풍부한 합성음이 더 밝게 측정되는지, 감쇠가 빠른 히트가 더
+짧게 측정되는지, 무음/샐리언스 없음에서 안전하게 None/{} 을 내는지, 그리고
+`_tag_notes`/`_merge_stems` 가 이 값들을 올바르게 옮기는지. `band06.wav` 로
+전체 파이프라인(`_mt3_dynamics`→`_mt3_stems`→`_merge_stems`) 종단 검증도
+했다 — 8개 유율 파트가 서로 다른 밝기(0.28~0.59)로, 드럼 261음 전부가
+자기 GM 피치의 실측값으로 태그됨.

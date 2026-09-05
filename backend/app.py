@@ -251,7 +251,7 @@ MIN_AGREEMENT = int(os.environ.get("MUSICNOTE_MT3_MIN_AGREEMENT", "2"))
 _PERSIST_KEYS = (
     "status", "stage", "pct", "message", "created", "mode", "http", "error",
     "result", "mt3_raw", "mt3_review", "mt3_model", "mt3_tempo", "mt3_beats",
-    "mt3_meter", "mt3_split_voices", "mt3_max_voices", "mt3_runs",
+    "mt3_meter", "mt3_split_voices", "mt3_max_voices", "mt3_runs", "mt3_tone",
     "mix_beats", "mix_tempo",
 )
 
@@ -414,16 +414,30 @@ def _stem_midi_url(job_id: str, stem: dict, tempo: float) -> Optional[str]:
 
 
 def _tag_notes(notes: list, stem_id: str, label: str, family: str | None = None,
-              program: int | None = None, is_drum: bool = False) -> list:
+              program: int | None = None, is_drum: bool = False,
+              brightness: float | None = None,
+              drum_profile: dict | None = None) -> list:
     # family/program/is_drum: so the frontend's synth can pick a timbre per
     # instrument (Player.FAMILY_VOICE in musicnote-core.js) instead of playing
     # every note — piano, bass, drum kit alike — through one generic tone.
+    # brightness/drum_profile (when measured — see _mt3_dynamics): a real
+    # per-song reading the synth prefers over that fixed per-family preset.
     tag: dict = {"stem": stem_id, "inst": label, "is_drum": is_drum}
     if family is not None:
         tag["family"] = family
     if program is not None:
         tag["program"] = program
-    return [{**n, **tag} for n in notes]
+    if brightness is not None:
+        tag["brightness"] = brightness
+    out = []
+    for n in notes:
+        d = {**n, **tag}
+        prof = (drum_profile or {}).get(str(int(n["pitch"]))) if drum_profile else None
+        if prof:
+            d["drum_centroid"] = prof["centroid_hz"]
+            d["drum_decay"] = prof["decay_s"]
+        out.append(d)
+    return out
 
 
 def _merge_stems(stems_out: list[dict]) -> tuple[list, list]:
@@ -434,7 +448,9 @@ def _merge_stems(stems_out: list[dict]) -> tuple[list, list]:
         if s.get("notes"):
             notes += _tag_notes(s["notes"], s["id"], s["label"],
                                 s.get("family"), s.get("program"),
-                                not s.get("pitched", True))
+                                not s.get("pitched", True),
+                                (s.get("instrument") or {}).get("features", {}).get("brightness"),
+                                s.get("drum_profile"))
     notes.sort(key=lambda n: (n["start"], n["pitch"]))
     contour: list = []
     if notes:
@@ -846,7 +862,7 @@ def _muscriptor_corroboration(mus_notes: list[dict] | None, merged: list[dict],
     return promoted
 
 
-def _mt3_dynamics(raw: list[dict], wav_path: str) -> None:
+def _mt3_dynamics(raw: list[dict], wav_path: str) -> dict:
     """Stamp every MT3 note with a real loudness (``dyn``) and a 10-point
     amplitude envelope (``env``), read from the audio's constant-Q transform.
 
@@ -861,20 +877,62 @@ def _mt3_dynamics(raw: list[dict], wav_path: str) -> None:
     ``velocity``, and a real loudness there would turn the sensitivity slider
     into a filter that deletes quiet notes. Done once per job so that a refine,
     which re-runs the gate and the voice split, stays instant.
+
+    Also measures a per-part TIMBRE while the audio is already loaded:
+    ``instrument_brightness`` for a pitched part, ``drum_hit_profile`` per kit
+    piece for a drum part — both real measurements of THIS song's own audio,
+    not a fixed preset per instrument family (see FAMILY_VOICE in
+    musicnote-core.js, which is what this replaces for the parts it can measure
+    and falls back to for the ones it can't). Keyed by ``_part_key(program,
+    is_drum)`` — a string, not the natural (int, bool) tuple, because this
+    gets persisted to job JSON (json.dumps rejects tuple keys) — the same key
+    ``_mt3_stems`` groups notes into stems by, so the caller can cache this
+    once and look it up per stem without a second pass over notes. Returns {}
+    on any failure — a missing measurement means playback falls back to the
+    family preset, never a broken job.
     """
+    tone: dict[str, dict] = {}
     try:
         y, sr = T.load_audio(wav_path)
         sal = T._salience_cqt(y, sr)
         if sal is None:
-            return
+            return tone
         pitched = [n for n in raw if not n.get("is_drum")]
         if pitched:
             T._note_dynamics(pitched, {"_sal": sal}, field="dyn", override=True)
         # Drum hits have no fundamental to read, so they keep a flat level.
         for n in raw:
             n.setdefault("dyn", int(n.get("velocity", 100)))
+
+        # Grouped by _part_key, not raw (program, is_drum): all percussion is
+        # one key regardless of program (see _part_key), so this must collapse
+        # BEFORE grouping — otherwise drum notes with different guessed
+        # programs would compute separate profiles that overwrite each other
+        # under the same "drum" key below instead of combining.
+        by_part: dict[str, list[dict]] = {}
+        for n in raw:
+            by_part.setdefault(_part_key(int(n.get("program", 0)),
+                                        bool(n.get("is_drum"))), []).append(n)
+        for key, notes in by_part.items():
+            if key == "drum":
+                profile = T.drum_hit_profile(y, sr, notes)
+                if profile:
+                    tone[key] = {"drum_profile": profile}
+            else:
+                b = T.instrument_brightness(notes, sal)
+                if b is not None:
+                    tone[key] = {"brightness": b}
     except Exception as e:  # noqa: BLE001
-        print(f"mt3 dynamics failed, playback stays flat: {e}", flush=True)
+        print(f"mt3 dynamics/tone failed, playback stays flat/generic: {e}", flush=True)
+    return tone
+
+
+def _part_key(program: int, is_drum: bool) -> str:
+    """String form of the same grouping _mt3_stems uses: all percussion is one
+    key regardless of program (a guessed, unstable value on drum tracks — see
+    _mt3_stems' own comment), pitched parts keyed by program. A plain tuple
+    can't be a JSON object key either way (job persistence)."""
+    return "drum" if is_drum else str(int(program))
 
 
 def _mt3_stems(job_id: str, raw: list[dict], sensitivity: float,
@@ -885,6 +943,7 @@ def _mt3_stems(job_id: str, raw: list[dict], sensitivity: float,
     Polyphonic lines are inferred from actual overlap, pitch continuity and
     register history. They are not claimed to be separate performers.
     """
+    tone: dict[str, dict] = JOBS.get(job_id, {}).get("mt3_tone") or {}
     s = max(0.0, min(1.0, sensitivity))
     kept, gate_report = MP.gate(raw, s)
     # The ensemble vote is the real sensitivity control on this path; the
@@ -946,6 +1005,7 @@ def _mt3_stems(job_id: str, raw: list[dict], sensitivity: float,
             continue
         fam, _ = MT3.map_family(d["program"], d["is_drum"])
         label = MT3.program_label(d["program"], d["is_drum"])
+        part_tone = tone.get(_part_key(d["program"], d["is_drum"])) or {}
         d["notes"].sort(key=lambda n: (n["start"], n["pitch"]))
 
         # A simultaneous onset is initially treated as a chord. It is split
@@ -975,7 +1035,15 @@ def _mt3_stems(job_id: str, raw: list[dict], sensitivity: float,
                 "tempo": 0.0, "sensitivity": round(s, 3),
                 "voice": suffix or None,
                 "instrument": {"selected": "auto", "detected": fam, "detected_label": vlabel,
-                               "preset": "neutral", "features": {}, "options": []},
+                               "preset": "neutral",
+                               "features": ({"brightness": part_tone["brightness"]}
+                                           if "brightness" in part_tone else {}),
+                               "options": []},
+                # Real per-kit-piece measurement from this song's own drum hits
+                # (backend/transcribe.drum_hit_profile) — {pitch: {centroid_hz,
+                # decay_s}}. None when unmeasured (silent audio, a failed read),
+                # so the frontend's synth falls back to its fixed drum presets.
+                "drum_profile": part_tone.get("drum_profile"),
                 "quantized": False, "beat_count": 0,
                 "note_count": len(notes),
                 "low_conf": sum(1 for n in notes if n["conf"] < 0.5),
@@ -1139,8 +1207,9 @@ def _mt3_pipeline(job_id: str, src_path: Path, audio_dur: float,
             review = [n for n in review
                      if (int(n["pitch"]), round(float(n["start"]), 4)) not in promoted_keys]
             print(f"muscriptor corroboration: +{len(corrob_extra)} notes", flush=True)
-        _mt3_dynamics(merged, str(src_path))
+        tone = _mt3_dynamics(merged, str(src_path))
         JOBS.get(job_id, {})["mt3_raw"] = merged
+        JOBS.get(job_id, {})["mt3_tone"] = tone
         JOBS.get(job_id, {})["mt3_runs"] = len(runs)
         JOBS.get(job_id, {})["mt3_review"] = review
         JOBS.get(job_id, {})["mt3_model"] = out.get("model", "mr_mt3")

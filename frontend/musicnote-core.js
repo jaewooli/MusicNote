@@ -141,8 +141,16 @@ function stemView(r, id) {
   // on one instrument lost the family the synth needs and fell back to the
   // generic tone.
   const isDrum = !s.pitched;
-  const notes = (s.notes || []).map(n => ('family' in n) ? n
-    : { ...n, family: s.family, program: s.program, is_drum: isDrum });
+  const brightness = (s.instrument && s.instrument.features || {}).brightness;
+  const drumProfile = s.drum_profile;
+  const notes = (s.notes || []).map((n) => {
+    if ('family' in n) return n;
+    const tagged = { ...n, family: s.family, program: s.program, is_drum: isDrum };
+    if (brightness != null) tagged.brightness = brightness;
+    const prof = drumProfile && drumProfile[String(n.pitch)];
+    if (prof) { tagged.drum_centroid = prof.centroid_hz; tagged.drum_decay = prof.decay_s; }
+    return tagged;
+  });
   return {
     engine: s.engine, mode: (s.engine === 'basic-pitch' || s.engine === 'cqt-fallback')
       ? 'polyphonic' : 'melody',
@@ -438,30 +446,53 @@ const Player = {
     other:    { partials: [0, 1.00, 0.35, 0.16], gainDb: 0.0, attack: 0.004 },  // = the old single tone
   },
   _voiceFor(family) { return this.FAMILY_VOICE[family] || this.FAMILY_VOICE.other; },
-  // One PeriodicWave pool per family, each partial given a random phase.
+  // n.brightness (0..1): how much of THIS part's own energy sits in its
+  // 2nd-4th harmonics vs its fundamental, measured from this song's own audio
+  // (backend/transcribe.instrument_brightness) — a real per-song reading, not
+  // a fixed guess. 0.5 is left as the family's own unmodified partial shape
+  // (roughly where an untagged/average part sits); above or below that
+  // redistributes energy toward or away from the harmonics while holding the
+  // partial stack's total amplitude constant, so brightness changes the
+  // COLOUR of the tone, not its loudness (that's still vpk/gainDb/_tilt).
+  // Undefined brightness (not measured, or a drum note) leaves the family's
+  // own partials untouched.
+  _partialsFor(family, brightness) {
+    const base = this._voiceFor(family).partials;
+    if (brightness == null) return base;
+    const scale = Math.max(0, 1 + (brightness - 0.5) * 1.6);
+    const adj = base.map((a, i) => (i <= 1 ? a : a * scale));
+    const baseTotal = base.reduce((s, a) => s + a, 0) || 1;
+    const adjTotal = adj.reduce((s, a) => s + a, 0) || baseTotal;
+    const norm = baseTotal / adjTotal;
+    return adj.map((a) => a * norm);
+  },
+  // One PeriodicWave pool per (family, brightness bucket) — brightness is
+  // rounded to a tenth so a whole part's near-identical measurements share
+  // one pool instead of minting a fresh one per note.
   //
-  // Why: every OscillatorNode starts at phase 0, so two notes an octave apart
-  // put an identical component (the lower note's 2nd partial, the upper note's
-  // fundamental) on the bus perfectly in phase and it adds coherently. Measured
-  // with BS.1770 K-weighting, an octave doubling was +4.5 dB over the note alone
-  // and a unison was +6.0 dB — the sound of one voice suddenly jumping out. On
-  // MT3 output 38% of notes are in a simultaneous octave and 21% in a unison, so
-  // this was firing constantly. Randomising the phase drops the octave case to
-  // +3.2 dB and the unison to +1.6 dB, which is what acoustic instruments do.
+  // Why randomise phase at all: every OscillatorNode starts at phase 0, so
+  // two notes an octave apart put an identical component (the lower note's
+  // 2nd partial, the upper note's fundamental) on the bus perfectly in phase
+  // and it adds coherently. Measured with BS.1770 K-weighting, an octave
+  // doubling was +4.5 dB over the note alone and a unison was +6.0 dB — the
+  // sound of one voice suddenly jumping out. On MT3 output 38% of notes are
+  // in a simultaneous octave and 21% in a unison, so this was firing
+  // constantly. Randomising the phase drops the octave case to +3.2 dB and
+  // the unison to +1.6 dB, which is what acoustic instruments do.
   //
-  // A fixed pool, indexed per note, keeps this deterministic across replays and
-  // costs one PeriodicWave per slot instead of one per note; one pool per
-  // family (not one shared pool) because each family's own partial amplitudes
-  // need the anti-coherence treatment, not the old generic default's.
-  _waves(family) {
-    if (this._wv[family]) return this._wv[family];
-    const amp = this._voiceFor(family).partials;
+  // A fixed pool, indexed per note, keeps this deterministic across replays
+  // and costs one PeriodicWave per slot instead of one per note.
+  _waves(family, brightness) {
+    const bucket = brightness == null ? '' : ':' + Math.round(brightness * 10);
+    const key = family + bucket;
+    if (this._wv[key]) return this._wv[key];
+    const amp = this._partialsFor(family, brightness);
     const pool = [];
     for (let i = 0; i < 12; i++) {
       const re = new Float32Array(amp.length), im = new Float32Array(amp.length);
       for (let k = 1; k < amp.length; k++) {
-        // deterministic per (family, slot, partial) so a replay sounds identical
-        const ph = 2 * Math.PI * ((Math.sin(i * 12.9898 + k * 78.233 + family.length * 3.71)
+        // deterministic per (key, slot, partial) so a replay sounds identical
+        const ph = 2 * Math.PI * ((Math.sin(i * 12.9898 + k * 78.233 + key.length * 3.71)
                                    * 43758.5453) % 1);
         re[k] = amp[k] * Math.sin(ph);      // cos term
         im[k] = amp[k] * Math.cos(ph);      // sin term
@@ -470,7 +501,7 @@ const Player = {
       // set, and would hand each slot a different loudness
       pool.push(this.ctx.createPeriodicWave(re, im, { disableNormalization: true }));
     }
-    return (this._wv[family] = pool);
+    return (this._wv[key] = pool);
   },
   // Equal digital gain is not equal loudness. Measured on this exact partial
   // stack with BS.1770 K-weighting, relative to C4: a note is quieter down low
@@ -517,9 +548,19 @@ const Player = {
     for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
     return (this._noise = buf);
   },
+  // n.drum_centroid/n.drum_decay: real spectral centroid (Hz) and decay time
+  // (s) measured from THIS recording's own hits at this GM slot (backend/
+  // transcribe.drum_hit_profile), when a read succeeded. clamp() keeps a
+  // noisy or atypical measurement from pushing a parameter somewhere the
+  // recipe's noise/filter/oscillator structure stops making sense (e.g. a
+  // "kick" whose sweep target ends up above 100 Hz stops reading as a kick).
+  // Falls back to the fixed constant when nothing was measured — never a
+  // missing sound.
+  _clamp(v, lo, hi, fallback) { return v == null ? fallback : Math.min(hi, Math.max(lo, v)); },
   _drumVoice(n, when, vpk) {
     const ac = this.ctx;
     const kind = this._drumKind(n.pitch);
+    const cent = n.drum_centroid, dec = n.drum_decay;
     const out = ac.createGain(); out.gain.value = vpk; out.connect(this._master);
     const noise = () => {
       const src = ac.createBufferSource(); src.buffer = this._noiseBuffer(); src.loop = true;
@@ -532,45 +573,57 @@ const Player = {
       g.gain.exponentialRampToValueAtTime(1e-4, t0 + decay);
     };
     if (kind === 'kick') {
+      const start = this._clamp(cent, 90, 260, 150);
+      const end = this._clamp(cent != null ? cent * 0.28 : null, 32, 70, 42);
+      const decay = this._clamp(dec, 0.12, 0.4, 0.22);
       const o = ac.createOscillator(); o.type = 'sine';
-      o.frequency.setValueAtTime(150, when);
-      o.frequency.exponentialRampToValueAtTime(42, when + 0.09);
-      const g = ac.createGain(); env(g, 1.0, 0.22, 0);
-      o.connect(g).connect(out); o.start(when); o.stop(when + 0.3); this._osc.push(o);
+      o.frequency.setValueAtTime(start, when);
+      o.frequency.exponentialRampToValueAtTime(end, when + 0.09);
+      const g = ac.createGain(); env(g, 1.0, decay, 0);
+      o.connect(g).connect(out); o.start(when); o.stop(when + decay + 0.08); this._osc.push(o);
     } else if (kind === 'snare') {
+      const center = this._clamp(cent, 900, 4000, 1800);
+      const decay = this._clamp(dec, 0.08, 0.3, 0.16);
       const src = noise(), bp = ac.createBiquadFilter();
-      bp.type = 'bandpass'; bp.frequency.value = 1800; bp.Q.value = 0.7;
-      const g = ac.createGain(); env(g, 1.0, 0.16, 0);
-      src.connect(bp).connect(g).connect(out); src.start(when); src.stop(when + 0.25);
+      bp.type = 'bandpass'; bp.frequency.value = center; bp.Q.value = 0.7;
+      const g = ac.createGain(); env(g, 1.0, decay, 0);
+      src.connect(bp).connect(g).connect(out); src.start(when); src.stop(when + decay + 0.05);
       this._osc.push(src);
       const o = ac.createOscillator(); o.type = 'triangle'; o.frequency.value = 190;
-      const g2 = ac.createGain(); env(g2, 0.5, 0.09, 0);
-      o.connect(g2).connect(out); o.start(when); o.stop(when + 0.15); this._osc.push(o);
+      const g2 = ac.createGain(); env(g2, 0.5, decay * 0.55, 0);
+      o.connect(g2).connect(out); o.start(when); o.stop(when + decay * 0.6); this._osc.push(o);
     } else if (kind === 'hihat_closed' || kind === 'hihat_open' || kind === 'cymbal') {
+      const fallbackDecay = kind === 'hihat_closed' ? 0.07 : kind === 'hihat_open' ? 0.35 : 1.1;
+      const hpFreq = this._clamp(cent, 3000, 10000, 6000);
+      const decay = this._clamp(dec, 0.04, 1.6, fallbackDecay);
       const src = noise(), hp = ac.createBiquadFilter();
-      hp.type = 'highpass'; hp.frequency.value = 6000;
-      const decay = kind === 'hihat_closed' ? 0.07 : kind === 'hihat_open' ? 0.35 : 1.1;
+      hp.type = 'highpass'; hp.frequency.value = hpFreq;
       const g = ac.createGain(); env(g, 0.7, decay, 0);
       src.connect(hp).connect(g).connect(out); src.start(when); src.stop(when + decay + 0.05);
       this._osc.push(src);
     } else if (kind === 'tom') {
+      const measured = this._clamp(cent, 90, 260, null);
+      const base = measured != null ? measured : 180 - Math.max(0, Math.min(24, n.pitch - 41)) * 4;
+      const decay = this._clamp(dec, 0.15, 0.5, 0.28);
       const o = ac.createOscillator(); o.type = 'sine';
-      const base = 180 - Math.max(0, Math.min(24, n.pitch - 41)) * 4;
       o.frequency.setValueAtTime(base * 1.4, when);
       o.frequency.exponentialRampToValueAtTime(base, when + 0.1);
-      const g = ac.createGain(); env(g, 0.9, 0.28, 0);
-      o.connect(g).connect(out); o.start(when); o.stop(when + 0.35); this._osc.push(o);
+      const g = ac.createGain(); env(g, 0.9, decay, 0);
+      o.connect(g).connect(out); o.start(when); o.stop(when + decay + 0.07); this._osc.push(o);
     } else if (kind === 'clap') {
+      const center = this._clamp(cent, 900, 3000, 1500);
+      const decay = this._clamp(dec, 0.05, 0.15, 0.08);
       for (let i = 0; i < 3; i++) {
         const src = noise(), bp = ac.createBiquadFilter();
-        bp.type = 'bandpass'; bp.frequency.value = 1500;
-        const g = ac.createGain(); env(g, 0.8, 0.08, i * 0.012);
-        src.connect(bp).connect(g).connect(out); src.start(when); src.stop(when + 0.15);
+        bp.type = 'bandpass'; bp.frequency.value = center;
+        const g = ac.createGain(); env(g, 0.8, decay, i * 0.012);
+        src.connect(bp).connect(g).connect(out); src.start(when); src.stop(when + decay + 0.08);
         this._osc.push(src);
       }
     } else {
-      const src = noise(); const g = ac.createGain(); env(g, 0.6, 0.1, 0);
-      src.connect(g).connect(out); src.start(when); src.stop(when + 0.15); this._osc.push(src);
+      const decay = this._clamp(dec, 0.05, 0.3, 0.1);
+      const src = noise(); const g = ac.createGain(); env(g, 0.6, decay, 0);
+      src.connect(g).connect(out); src.start(when); src.stop(when + decay + 0.05); this._osc.push(src);
     }
   },
   _voice(n) {
@@ -606,7 +659,7 @@ const Player = {
     g.gain.linearRampToValueAtTime(1e-4, tail);                  // clean tail
     g.connect(this._master);
     const o = ac.createOscillator();
-    const wv = this._waves(n.family || 'other');
+    const wv = this._waves(n.family || 'other', n.brightness);
     o.setPeriodicWave(wv[(this._wi = (this._wi + 1) % wv.length)]);
     o.frequency.value = n.freq;
     // A family filter chain sits between the oscillator and the envelope

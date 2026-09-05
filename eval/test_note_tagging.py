@@ -48,6 +48,37 @@ def test_merge_stems_propagates_family_and_drum_flag_per_stem():
     assert by_stem["drums"]["is_drum"] is True
 
 
+def test_tag_notes_carries_measured_brightness():
+    out = A._tag_notes([_note(40)], "track33", "베이스", brightness=0.62)
+    assert out[0]["brightness"] == 0.62
+
+
+def test_tag_notes_looks_up_drum_profile_by_pitch():
+    # Real key is a string (drum_hit_profile's docstring: json round-trips an
+    # int dict key back as a string), so the lookup must tolerate that too.
+    profile = {"36": {"centroid_hz": 120.0, "decay_s": 0.2},
+              "38": {"centroid_hz": 1900.0, "decay_s": 0.15}}
+    out = A._tag_notes([_note(36), _note(41)], "drums", "드럼",
+                       is_drum=True, drum_profile=profile)
+    assert out[0]["drum_centroid"] == 120.0 and out[0]["drum_decay"] == 0.2
+    assert "drum_centroid" not in out[1], "an unmeasured pitch must not get a stray profile"
+
+
+def test_merge_stems_propagates_brightness_and_drum_profile():
+    stems = [
+        {"id": "track33", "label": "베이스", "family": "bass", "program": 33,
+         "pitched": True, "notes": [_note(40, 0.0)],
+         "instrument": {"features": {"brightness": 0.3}}},
+        {"id": "drums", "label": "드럼", "family": "percussion", "program": 0,
+         "pitched": False, "notes": [_note(36, 0.5)],
+         "drum_profile": {"36": {"centroid_hz": 110.0, "decay_s": 0.18}}},
+    ]
+    notes, _contour = A._merge_stems(stems)
+    by_stem = {n["stem"]: n for n in notes}
+    assert by_stem["track33"]["brightness"] == 0.3
+    assert by_stem["drums"]["drum_centroid"] == 110.0
+
+
 def main() -> int:
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

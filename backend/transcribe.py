@@ -762,6 +762,88 @@ def _salience_ratio(n: dict, sal: dict) -> float:
 _ENV_PTS = 10   # per-note amplitude-envelope samples
 
 
+def instrument_brightness(notes: list[dict], sal: dict, sample: int = 24) -> float | None:
+    """0..1: how much of a part's own-pitch energy sits in its 2nd-4th
+    harmonics rather than the fundamental, read from the mix's own CQT at
+    each note's own onset — a real, per-song measurement of whether THIS
+    instrument sounds bright/rich or dull/round here, not a fixed preset per
+    instrument family. Uses the same fundamental+2nd+3rd(+4th) CQT-row
+    convention as _note_dynamics' loudness read, just as a ratio instead of
+    a sum.
+
+    Aggregated (median) over a sample of the part's own notes for stability:
+    a single note's read is noisy, and in a dense mix is sometimes
+    contaminated by another simultaneous instrument at a harmonically
+    related pitch — the same caveat _mt3_octaves' per-part (not per-note)
+    design already lives with.
+    """
+    C, ct = sal.get("C"), sal.get("t")
+    if C is None or ct is None or not notes:
+        return None
+    nb, nf = C.shape
+    pick = notes if len(notes) <= sample else [
+        notes[i] for i in np.linspace(0, len(notes) - 1, sample).round().astype(int)]
+    ratios = []
+    for n in pick:
+        i0 = min(int(np.searchsorted(ct, float(n["start"]))), nf - 1)
+        i1 = min(max(i0 + 1, int(np.searchsorted(ct, float(n["end"])))), nf)
+        base = int(round(n["pitch"])) - _SAL_BASE_MIDI
+        if not (0 <= base < nb):
+            continue
+        fund = float(C[base, i0:i1].mean())
+        harm_rows = [r for r in (base + 12, base + 19, base + 24) if 0 <= r < nb]
+        harm = float(C[harm_rows, i0:i1].mean()) if harm_rows else 0.0
+        total = fund + harm
+        if total > 1e-9:
+            ratios.append(harm / total)
+    return float(np.median(ratios)) if ratios else None
+
+
+def drum_hit_profile(y: np.ndarray, sr: int, notes: list[dict],
+                     sample: int = 8) -> dict[str, dict]:
+    """{str(pitch): {centroid_hz, decay_s}} measured from real onsets in the
+    mix, per GM kit piece — so a kick/snare/hihat's synthesised shape follows
+    what THIS recording's kit actually sounds like (bright/tight vs boomy/
+    loose) instead of one fixed preset. Unlike instrument_brightness this
+    reads the raw waveform, not the CQT: a drum hit is mostly noise, which a
+    constant-Q *pitch* salience map has nothing meaningful to say about.
+
+    Keyed by the STRING form of the pitch, not the int: this dict rides
+    through job persistence (json.dumps/loads), which is happy to write an
+    int dict key but always reads it back as a string — an int-keyed dict
+    would silently stop matching after a restart.
+    """
+    by_pitch: dict[int, list[dict]] = {}
+    for n in notes:
+        by_pitch.setdefault(int(n["pitch"]), []).append(n)
+    out: dict[str, dict] = {}
+    win = int(0.15 * sr)
+    for pitch, ns in by_pitch.items():
+        pick = ns if len(ns) <= sample else [
+            ns[i] for i in np.linspace(0, len(ns) - 1, sample).round().astype(int)]
+        centroids, decays = [], []
+        for n in pick:
+            i0 = int(round(float(n["start"]) * sr))
+            seg = y[i0:i0 + win]
+            if seg.size < sr // 50:
+                continue
+            try:
+                cent = float(np.mean(librosa.feature.spectral_centroid(y=seg, sr=sr)))
+            except Exception:
+                continue
+            rms = librosa.feature.rms(y=seg)[0]
+            if rms.size < 2 or rms[0] <= 1e-9:
+                continue
+            below = np.where(rms <= rms[0] * 0.5)[0]
+            decay_frames = int(below[0]) if below.size else rms.size
+            decays.append(decay_frames * 512 / sr)   # librosa.feature.rms default hop
+            centroids.append(cent)
+        if centroids:
+            out[str(pitch)] = {"centroid_hz": round(float(np.median(centroids)), 1),
+                              "decay_s": round(float(np.median(decays)), 3)}
+    return out
+
+
 def _note_dynamics(notes: list[dict], a: dict, field: str = "velocity",
                    override: bool | None = None) -> list[dict]:
     """Give every note a real loudness + a per-note amplitude envelope, read from
