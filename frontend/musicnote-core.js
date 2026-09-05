@@ -135,11 +135,19 @@ function stemFor(r, id) { return (r.stems || []).find(s => s.id === id); }
 
 function stemView(r, id) {
   const s = stemFor(r, id) || {};
+  // A single stem is one instrument throughout, so tag its notes with that
+  // family/program here too (the merged/lead views are already tagged
+  // server-side, backend/app.py::_tag_notes) — otherwise picking "이 선율 보기"
+  // on one instrument lost the family the synth needs and fell back to the
+  // generic tone.
+  const isDrum = !s.pitched;
+  const notes = (s.notes || []).map(n => ('family' in n) ? n
+    : { ...n, family: s.family, program: s.program, is_drum: isDrum });
   return {
     engine: s.engine, mode: (s.engine === 'basic-pitch' || s.engine === 'cqt-fallback')
       ? 'polyphonic' : 'melody',
-    duration: r.duration, tempo: s.tempo || r.tempo || 0, note_count: (s.notes || []).length,
-    notes: s.notes || [], contour: s.contour || [],
+    duration: r.duration, tempo: s.tempo || r.tempo || 0, note_count: notes.length,
+    notes, contour: s.contour || [],
     sensitivity: typeof s.sensitivity === 'number' ? s.sensitivity : 0.5,
     quantized: !!s.quantized, beat_count: s.beat_count,
     key: s.key || null, low_conf: s.low_conf || 0,
@@ -373,7 +381,7 @@ function drawRoll(d) {
 const Player = {
   ctx: null, notes: [], dur: 0, pos: 0, playing: false,
   _master: null, _limit: null, _startCtx: 0, _startPos: 0, _next: 0, _timer: 0, _raf: 0, _osc: [],
-  _wv: null, _wi: 0,
+  _wv: {}, _wi: 0, _noise: null,
   _ac() {
     if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)();
     return this.ctx;
@@ -398,8 +406,39 @@ const Player = {
     if (this._master) { try { this._master.disconnect(); } catch (_) {} this._master = null; }
     if (this._limit) { try { this._limit.disconnect(); } catch (_) {} this._limit = null; }
   },
-  // One PeriodicWave per pool slot, partials at 1/2/3 with the same amplitudes
-  // the three oscillators used to have, but each partial given a random phase.
+  // ---- per-instrument timbre ---------------------------------------------
+  // Keyed by the family the backend already classifies each note into
+  // (backend/mt3_bridge.map_family: keyboard/plucked/bass/strings/winds/
+  // synth/other — is_drum is a separate path below, not a family here).
+  // `partials` shapes the harmonic content; `gainDb` balances families
+  // against each other; `fallbackEnv` replaces the plucked/decay default
+  // shape for a family whose notes came without a measured envelope
+  // (backend/transcribe._note_dynamics only ran on this note's own audio when
+  // one exists); `highpass`/`lowpass` add a per-family filter.
+  //
+  // `bass` is the one built deliberately different, for the "blows the
+  // speaker" complaint: its fundamental sits at 30-80 Hz (E1-E2), which small
+  // speakers either can't reproduce and strain trying, or reproduce as rattle.
+  // A real bass amp/cab leans on the same trick this does — most of what
+  // actually reads as "bass" is the 2nd/3rd harmonic, an octave or so up, in a
+  // range speakers handle cleanly; the fundamental supplies the pitch, not
+  // the loudness. Lowering the fundamental's amplitude in the partial stack,
+  // adding a highpass below the note's own fundamental, and trimming the
+  // overall level reproduces that instead of just turning the raw tone down.
+  FAMILY_VOICE: {
+    keyboard: { partials: [0, 1.00, 0.42, 0.22, 0.10], gainDb: 0.0, attack: 0.004 },
+    plucked:  { partials: [0, 1.00, 0.55, 0.32, 0.16], gainDb: -1.0, attack: 0.002 },
+    bass:     { partials: [0, 0.42, 1.00, 0.40, 0.10], gainDb: -3.5, attack: 0.006,
+               highpass: 48, lowpass: 2200 },
+    strings:  { partials: [0, 1.00, 0.62, 0.40, 0.24, 0.12], gainDb: -1.0, attack: 0.05,
+               fallbackEnv: [40, 92, 118, 124, 116, 104, 90, 74, 52, 28] },
+    winds:    { partials: [0, 1.00, 0.28, 0.46, 0.16, 0.08], gainDb: -1.0, attack: 0.035,
+               fallbackEnv: [55, 100, 118, 122, 114, 100, 86, 68, 46, 24] },
+    synth:    { partials: [0, 1.00, 0.50, 0.50, 0.30, 0.18], gainDb: -1.0, attack: 0.008 },
+    other:    { partials: [0, 1.00, 0.35, 0.16], gainDb: 0.0, attack: 0.004 },  // = the old single tone
+  },
+  _voiceFor(family) { return this.FAMILY_VOICE[family] || this.FAMILY_VOICE.other; },
+  // One PeriodicWave pool per family, each partial given a random phase.
   //
   // Why: every OscillatorNode starts at phase 0, so two notes an octave apart
   // put an identical component (the lower note's 2nd partial, the upper note's
@@ -411,30 +450,35 @@ const Player = {
   // +3.2 dB and the unison to +1.6 dB, which is what acoustic instruments do.
   //
   // A fixed pool, indexed per note, keeps this deterministic across replays and
-  // costs one PeriodicWave per slot instead of one per note.
-  _waves() {
-    if (this._wv) return this._wv;
-    const amp = [0, 1.0, 0.35, 0.16];
-    this._wv = [];
+  // costs one PeriodicWave per slot instead of one per note; one pool per
+  // family (not one shared pool) because each family's own partial amplitudes
+  // need the anti-coherence treatment, not the old generic default's.
+  _waves(family) {
+    if (this._wv[family]) return this._wv[family];
+    const amp = this._voiceFor(family).partials;
+    const pool = [];
     for (let i = 0; i < 12; i++) {
       const re = new Float32Array(amp.length), im = new Float32Array(amp.length);
       for (let k = 1; k < amp.length; k++) {
-        // deterministic per (slot, partial) so a replay sounds identical
-        const ph = 2 * Math.PI * ((Math.sin(i * 12.9898 + k * 78.233) * 43758.5453) % 1);
+        // deterministic per (family, slot, partial) so a replay sounds identical
+        const ph = 2 * Math.PI * ((Math.sin(i * 12.9898 + k * 78.233 + family.length * 3.71)
+                                   * 43758.5453) % 1);
         re[k] = amp[k] * Math.sin(ph);      // cos term
         im[k] = amp[k] * Math.cos(ph);      // sin term
       }
       // no normalisation: it divides by peak amplitude, which differs per phase
       // set, and would hand each slot a different loudness
-      this._wv.push(this.ctx.createPeriodicWave(re, im, { disableNormalization: true }));
+      pool.push(this.ctx.createPeriodicWave(re, im, { disableNormalization: true }));
     }
-    return this._wv;
+    return (this._wv[family] = pool);
   },
   // Equal digital gain is not equal loudness. Measured on this exact partial
   // stack with BS.1770 K-weighting, relative to C4: a note is quieter down low
   // and louder up high, by up to +3.4 dB at C7. Left uncorrected, a spurious
   // octave-up note is louder than the real note it doubles purely because it is
   // higher. Table is the measurement; linear interpolation between points.
+  // Pitched notes only — a drum "pitch" is a kit slot, not a register, so this
+  // has nothing to compensate for there (see _drumVoice's own balance instead).
   _tilt(midi) {
     const T = [[36, -2.10], [48, -0.49], [60, 0.00], [72, 0.31], [84, 1.33], [96, 3.42]];
     const m = Math.max(T[0][0], Math.min(T[T.length - 1][0], midi));
@@ -448,18 +492,107 @@ const Player = {
     }
     return Math.pow(10, -d / 20);
   },
+
+  // ---- percussion: GM drum slots are kit positions, not pitches ----------
+  // A kick's "pitch" (35/36) run through the harmonic oscillator above played
+  // an atonal blip at whatever frequency that slot number happens to map to.
+  // Each hit is instead a short, shaped noise burst (+ a pitched thump for
+  // kick/tom) keyed by the GM number into the handful of kit pieces that need
+  // a genuinely different shape to read as themselves.
+  _drumKind(pitch) {
+    if (pitch === 35 || pitch === 36) return 'kick';
+    if (pitch === 37 || pitch === 38 || pitch === 40) return 'snare';
+    if (pitch === 42 || pitch === 44) return 'hihat_closed';
+    if (pitch === 46) return 'hihat_open';
+    if ([49, 51, 52, 55, 57, 59].includes(pitch)) return 'cymbal';
+    if ([41, 43, 45, 47, 48, 50].includes(pitch)) return 'tom';
+    if (pitch === 39) return 'clap';
+    return 'other';
+  },
+  _noiseBuffer() {
+    if (this._noise) return this._noise;
+    const ac = this.ctx, n = Math.round(ac.sampleRate * 1.0);
+    const buf = ac.createBuffer(1, n, ac.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+    return (this._noise = buf);
+  },
+  _drumVoice(n, when, vpk) {
+    const ac = this.ctx;
+    const kind = this._drumKind(n.pitch);
+    const out = ac.createGain(); out.gain.value = vpk; out.connect(this._master);
+    const noise = () => {
+      const src = ac.createBufferSource(); src.buffer = this._noiseBuffer(); src.loop = true;
+      return src;
+    };
+    const env = (g, peak, decay, delay) => {
+      const t0 = when + (delay || 0);
+      g.gain.setValueAtTime(0, t0);
+      g.gain.linearRampToValueAtTime(peak, t0 + 0.002);
+      g.gain.exponentialRampToValueAtTime(1e-4, t0 + decay);
+    };
+    if (kind === 'kick') {
+      const o = ac.createOscillator(); o.type = 'sine';
+      o.frequency.setValueAtTime(150, when);
+      o.frequency.exponentialRampToValueAtTime(42, when + 0.09);
+      const g = ac.createGain(); env(g, 1.0, 0.22, 0);
+      o.connect(g).connect(out); o.start(when); o.stop(when + 0.3); this._osc.push(o);
+    } else if (kind === 'snare') {
+      const src = noise(), bp = ac.createBiquadFilter();
+      bp.type = 'bandpass'; bp.frequency.value = 1800; bp.Q.value = 0.7;
+      const g = ac.createGain(); env(g, 1.0, 0.16, 0);
+      src.connect(bp).connect(g).connect(out); src.start(when); src.stop(when + 0.25);
+      this._osc.push(src);
+      const o = ac.createOscillator(); o.type = 'triangle'; o.frequency.value = 190;
+      const g2 = ac.createGain(); env(g2, 0.5, 0.09, 0);
+      o.connect(g2).connect(out); o.start(when); o.stop(when + 0.15); this._osc.push(o);
+    } else if (kind === 'hihat_closed' || kind === 'hihat_open' || kind === 'cymbal') {
+      const src = noise(), hp = ac.createBiquadFilter();
+      hp.type = 'highpass'; hp.frequency.value = 6000;
+      const decay = kind === 'hihat_closed' ? 0.07 : kind === 'hihat_open' ? 0.35 : 1.1;
+      const g = ac.createGain(); env(g, 0.7, decay, 0);
+      src.connect(hp).connect(g).connect(out); src.start(when); src.stop(when + decay + 0.05);
+      this._osc.push(src);
+    } else if (kind === 'tom') {
+      const o = ac.createOscillator(); o.type = 'sine';
+      const base = 180 - Math.max(0, Math.min(24, n.pitch - 41)) * 4;
+      o.frequency.setValueAtTime(base * 1.4, when);
+      o.frequency.exponentialRampToValueAtTime(base, when + 0.1);
+      const g = ac.createGain(); env(g, 0.9, 0.28, 0);
+      o.connect(g).connect(out); o.start(when); o.stop(when + 0.35); this._osc.push(o);
+    } else if (kind === 'clap') {
+      for (let i = 0; i < 3; i++) {
+        const src = noise(), bp = ac.createBiquadFilter();
+        bp.type = 'bandpass'; bp.frequency.value = 1500;
+        const g = ac.createGain(); env(g, 0.8, 0.08, i * 0.012);
+        src.connect(bp).connect(g).connect(out); src.start(when); src.stop(when + 0.15);
+        this._osc.push(src);
+      }
+    } else {
+      const src = noise(); const g = ac.createGain(); env(g, 0.6, 0.1, 0);
+      src.connect(g).connect(out); src.start(when); src.stop(when + 0.15); this._osc.push(src);
+    }
+  },
   _voice(n) {
     const ac = this.ctx;
     const when = Math.max(this._startCtx + (n.start - this._startPos), ac.currentTime + 0.004);
     const end = this._startCtx + (n.end - this._startPos);
     if (end <= ac.currentTime + 0.01) return;
     const dur = Math.max(0.03, end - when);
-    const vpk = (0.045 + 0.5 * Math.pow((n.velocity || 90) / 127, 1.35))
-              * this._tilt(n.pitch != null ? n.pitch : 60);          // peak gain
-    // per-note amplitude envelope from the backend (10-pt, own-peak-normalised),
-    // so struck-and-decaying / swelling notes actually sound that way
-    const e = (Array.isArray(n.env) && n.env.length >= 2)
-      ? n.env : [124, 118, 100, 82, 66, 52, 40, 30, 20, 10];
+    let vpk = 0.045 + 0.5 * Math.pow((n.velocity || 90) / 127, 1.35);       // peak gain
+    if (!n.is_drum) vpk *= this._tilt(n.pitch != null ? n.pitch : 60);
+
+    if (n.is_drum) { this._drumVoice(n, when, vpk); return; }
+
+    const v = this._voiceFor(n.family);
+    vpk *= Math.pow(10, (v.gainDb || 0) / 20);
+    // per-note amplitude envelope from the backend (10-pt, own-peak-normalised)
+    // where one was measured on this note's own audio; otherwise a shape that
+    // at least matches the family's own articulation (a struck/plucked note
+    // decays from onset, a bowed/blown one swells in) rather than always the
+    // same plucked-decay default.
+    const e = (Array.isArray(n.env) && n.env.length >= 2) ? n.env
+      : (v.fallbackEnv || [124, 118, 100, 82, 66, 52, 40, 30, 20, 10]);
     const curve = new Float32Array(e.length);
     for (let k = 0; k < e.length; k++) curve[k] = Math.max(1e-4, (e[k] / 127) * vpk);
     const g = ac.createGain();
@@ -472,11 +605,23 @@ const Player = {
     }
     g.gain.linearRampToValueAtTime(1e-4, tail);                  // clean tail
     g.connect(this._master);
-    const wv = this._waves();
     const o = ac.createOscillator();
+    const wv = this._waves(n.family || 'other');
     o.setPeriodicWave(wv[(this._wi = (this._wi + 1) % wv.length)]);
     o.frequency.value = n.freq;
-    o.connect(g);
+    // A family filter chain sits between the oscillator and the envelope
+    // (built fresh per note — cheap, native biquads — since notes overlap and
+    // can't share one filter instance).
+    let node = o;
+    if (v.highpass) {
+      const hp = ac.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = v.highpass;
+      node.connect(hp); node = hp;
+    }
+    if (v.lowpass) {
+      const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = v.lowpass;
+      node.connect(lp); node = lp;
+    }
+    node.connect(g);
     o.start(when); o.stop(tail + 0.02);
     this._osc.push(o);
   },

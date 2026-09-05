@@ -413,8 +413,17 @@ def _stem_midi_url(job_id: str, stem: dict, tempo: float) -> Optional[str]:
         return None
 
 
-def _tag_notes(notes: list, stem_id: str, label: str) -> list:
-    return [{**n, "stem": stem_id, "inst": label} for n in notes]
+def _tag_notes(notes: list, stem_id: str, label: str, family: str | None = None,
+              program: int | None = None, is_drum: bool = False) -> list:
+    # family/program/is_drum: so the frontend's synth can pick a timbre per
+    # instrument (Player.FAMILY_VOICE in musicnote-core.js) instead of playing
+    # every note — piano, bass, drum kit alike — through one generic tone.
+    tag: dict = {"stem": stem_id, "inst": label, "is_drum": is_drum}
+    if family is not None:
+        tag["family"] = family
+    if program is not None:
+        tag["program"] = program
+    return [{**n, **tag} for n in notes]
 
 
 def _merge_stems(stems_out: list[dict]) -> tuple[list, list]:
@@ -423,7 +432,9 @@ def _merge_stems(stems_out: list[dict]) -> tuple[list, list]:
     notes: list = []
     for s in stems_out:
         if s.get("notes"):
-            notes += _tag_notes(s["notes"], s["id"], s["label"])
+            notes += _tag_notes(s["notes"], s["id"], s["label"],
+                                s.get("family"), s.get("program"),
+                                not s.get("pitched", True))
     notes.sort(key=lambda n: (n["start"], n["pitch"]))
     contour: list = []
     if notes:
@@ -602,8 +613,15 @@ def _assemble(job_id: str, mode: str, stems_out: list[dict],
                       low_conf=sum(1 for n in notes if n.get("conf", 1.0) < 0.5),
                       midi_url=_write_merged_midi(job_id, stems_out, tempo))
     else:  # melody + stems: default view = the lead line
+        # Tagged the same way _merge_stems tags the polyphonic view, so the
+        # frontend's per-instrument synth (Player.FAMILY_VOICE) has a family
+        # to key on here too, not only when every stem is merged into one list.
+        lead_notes = _tag_notes(
+            (lead or {}).get("notes", []), (lead or {}).get("id", ""),
+            (lead or {}).get("label", ""), (lead or {}).get("family"),
+            (lead or {}).get("program"), not (lead or {}).get("pitched", True))
         result.update(
-            notes=(lead or {}).get("notes", []),
+            notes=lead_notes,
             contour=(lead or {}).get("contour", []),
             midi_url=(lead or {}).get("midi_url"),
             low_conf=(lead or {}).get("low_conf", 0),
