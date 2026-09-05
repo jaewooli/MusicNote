@@ -1810,3 +1810,58 @@ downbeatF1 **0.273** (0/13 다운비트 중 여러 개가 0.000, 템포를 정�
 **결론이 바뀐다: 하이브리드 형태 그대로 진행.** medium/large 로 스케일을
 올려서 하나의 모델로 통일하는 길은 막힌 것으로 보고, 남은 건 (3) 통합
 작업뿐이다.
+
+### large(1.4B) 까지 실측 — 사용자 요청으로 GPU 를 다시 빌려 확인
+
+CPU 로 large 를 돌리다 이 박스(11GB, 이 프로젝트 말고도 다른 서비스 여럿이
+같이 떠 있음) 커널 OOM 으로 프로세스가 죽었다(RSS 8.8GB). 다른 서비스는
+멀쩡했지만(커널이 메모리를 제일 많이 먹은 프로세스만 정확히 골라 죽임),
+로컬에서는 안전하게 돌릴 수 없다고 판단해 vast.ai GPU(RTX A4000, 16GB, 약
+$0.09/시간)를 새로 빌려 확인했다.
+
+| 클립 | small | medium | large |
+|---|---|---|---|
+| band06 (최악 음색) | 0.544 | 0.526 | 0.542 |
+| band04 (양호) | 0.891 | 0.964 | 0.902 |
+| ref00 (솔로) | 0.666 | 0.717 | 0.727 |
+| ref03 (솔로) | 0.620 | 0.736 | 0.754 |
+
+**세 크기에 걸쳐 패턴이 확정됐다**: 솔로는 커질수록 아주 조금씩 오르지만
+0.73 근처에서 사실상 멈추고(우리 파이프라인의 0.92~0.99 에는 안 닿는다),
+가장 심각했던 밴드 클립(band06)은 103M 에서 1.4B 까지 가도 전혀 안 움직인다
+(0.544 → 0.526 → 0.542, 사실상 잡음). **모델을 키운다고 풀리는 문제가
+아니라는 게 이제 확정적이다** — 학습 분포 자체의 특성이라는 앞선 가설과
+일치한다. 배포에는 **small** 을 그대로 쓴다: 나머지 두 크기가 사는 값이
+없다.
+
+GPU 는 테스트 끝나자마자 반납했다(`vastai destroy instance`).
+
+### 통합: MuScriptor small 을 타깃 보강 패스로 배포
+
+`mt3_worker.py`/`mt3_bridge.py` 와 같은 모양으로 새 워커·브리지 쌍을 추가했다
+— muscriptor 의 의존성 트리(다른 torch 버전)가 mt3-infer 나 메인 앱 venv 를
+건드리지 않도록:
+
+- `backend/muscriptor_worker.py` — 자체 venv(`~/muscriptor-venv`)에서 도는
+  HTTP 서버. `mt3_worker.py` 와 같은 `/health`·`/transcribe` 모양을 그대로
+  따른다. MuScriptor 자체 음색 어휘(`get_group_program_map`)로 대표 GM
+  program 번호도 같이 매겨서, `instrument`(세부 음색 라벨) 필드 하나만
+  추가하고 나머지는 기존 다운스트림 코드(voices.py, musicxml.py 등)가
+  이해하는 스키마 그대로 유지한다.
+- `backend/muscriptor_bridge.py` — 클라이언트. 원격 GPU 경로는 아직 없다 —
+  small 모델이 이 CPU 에서도 거의 실시간이라 필요가 없었다.
+- `backend/app.py::_muscriptor_timbre_rescue` — 베이스 레지스터 구조
+  (`_mt3_bass_rescue`)와 같은 패턴이지만 게이트가 **음역이 아니라 음색
+  라벨**이다(`MUSCRIPTOR_TIMBRES = electric_bass, organ, synth_lead,
+  synth_pad, tuba` — 우리 파이프라인이 실측으로 약한 걸 확인한 것만). 이미
+  채택된 음과 겹치지 않는 것만, agreement 를 총 실행 수로 얹어서 추가한다.
+  옥타브 보정 뒤·다이내믹스 앞에 끼운다. GPU 게이트는 없음(패스 자체가
+  싸다) — `MUSICNOTE_MUSCRIPTOR_RESCUE=0` 으로 끌 수 있다.
+- `ecosystem.config.js` 에 `muscriptor-worker` pm2 앱 추가, `small` 고정.
+  medium/large 를 안 쓰는 이유는 바로 위 절 참조.
+- `eval/test_muscriptor_rescue.py` — 실제 워커 없이 게이팅/중복 방지/장애
+  허용을 검증하는 6개 테스트.
+
+HF 게이트 인증은 pm2 의 `env` 블록이 아니라 `huggingface_hub.login()` 으로
+`~/.cache/huggingface/` 표준 캐시에 한 번 써 뒀다 — 토큰을 커밋되는 설정
+파일에 두지 않기 위해서다.
