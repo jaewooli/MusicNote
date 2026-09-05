@@ -8,8 +8,17 @@ uploads/
 backend/cookies.txt
 cookies.txt
 
+# The blanket *.mid above is meant for MIDI a job writes out, not the ground
+# truth shipped with the eval reference sets — without these, replay_eval /
+# eval_meter / audit_score have no notes to score against, silently, on a
+# fresh clone. (eval/refs/*.mid was missing for this exact reason until now.)
+!eval/refs/*.mid
+!eval/refs_band/*.mid
+!eval/refs_meter/*.mid
+
 # cached MT3 raw output for eval/replay_eval.py (regenerate with eval/mt3_cache.py)
 eval/refs/*.mt3*.json
+eval/refs_band/*.mt3*.json
 
 # staged by deploy/vast/build.sh, never committed (700 MB of model weights)
 deploy/vast/checkpoints/

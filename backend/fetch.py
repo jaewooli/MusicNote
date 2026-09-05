@@ -67,6 +67,45 @@ def cookies_available() -> bool:
 POT_BASEURL = os.environ.get("MUSICNOTE_POT_BASEURL", "http://127.0.0.1:4416")
 
 
+# YouTube's "n" challenge is a JS puzzle: without a JavaScript runtime yt-dlp
+# cannot solve it, every progressive format comes back without a URL, and the
+# extractor ends with the entirely unrelated-looking message
+#   ERROR: [youtube] <id>: The page needs to be reloaded.
+# The real symptom is one debug line above it, "JS runtimes: none".
+#
+# Deno is installed here but under ~/.local/deno/bin, which is not on the PATH
+# pm2 hands the app, so yt-dlp found nothing. Rather than depend on the
+# launcher's environment — the app is started by pm2, by hand, and by tests, all
+# with different PATHs — the runtime is located here and passed to yt-dlp
+# explicitly. yt-dlp's API takes {name: {"path": ...}} — note it reads
+# config.get('path') with no None guard, so the inner dict is required.
+#
+# Node is checked too but is usually rejected: yt-dlp requires Node >= 22 and
+# this box has 20.20.2, which it reports as "Node.js version too low".
+_JS_RUNTIME_PATHS = {
+    "deno": ("deno", "~/.local/deno/bin/deno", "~/.deno/bin/deno",
+             "/usr/local/bin/deno"),
+    "node": ("node", "/usr/local/bin/node"),
+}
+
+
+def js_runtimes() -> dict[str, dict[str, str]]:
+    """Locate JS runtimes for yt-dlp, preferring deno. Empty = none installed."""
+    import shutil
+
+    found: dict[str, dict[str, str]] = {}
+    for name, candidates in _JS_RUNTIME_PATHS.items():
+        for c in candidates:
+            path = shutil.which(c) if "/" not in c else None
+            if path is None:
+                q = Path(c).expanduser()
+                path = str(q) if q.is_file() and os.access(q, os.X_OK) else None
+            if path:
+                found[name] = {"path": path}
+                break
+    return found
+
+
 def pot_server_up() -> bool:
     import urllib.request
     try:
@@ -108,6 +147,9 @@ def download_audio(url: str, dest_dir: Path,
             "youtubepot-bgutilhttp": {"base_url": [POT_BASEURL]},
         },
     }
+    runtimes = js_runtimes()
+    if runtimes:
+        ydl_opts["js_runtimes"] = runtimes
     cf = _cookiefile()
     if cf:
         ydl_opts["cookiefile"] = cf
@@ -134,6 +176,11 @@ def download_audio(url: str, dest_dir: Path,
             base = os.path.splitext(ydl.prepare_filename(info))[0]
     except yt_dlp.utils.DownloadError as e:
         msg = str(e)
+        if "needs to be reloaded" in msg and not js_runtimes():
+            raise RuntimeError(
+                "YouTube의 JS 'n' 챌린지를 풀 자바스크립트 런타임이 없습니다. "
+                "Deno 를 설치하거나(https://deno.land) Node 22 이상을 PATH 에 "
+                "두세요. (파일 업로드는 영향받지 않습니다.)")
         if "confirm you" in msg or "Sign in" in msg or "cookies" in msg.lower():
             raise NeedsCookies(
                 "YouTube가 이 서버 IP를 봇으로 차단했습니다. PO-token provider·Deno 는 "
