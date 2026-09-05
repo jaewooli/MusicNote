@@ -20,6 +20,11 @@ cookies.txt
 eval/refs/*.mt3*.json
 eval/refs_band/*.mt3*.json
 
+# cached MuScriptor raw output (regenerate with scratchpad/cache_muscriptor.py-
+# style script; the muscriptor-worker pm2 app must be up)
+eval/refs/*.muscriptor.json
+eval/refs_band/*.muscriptor.json
+
 # staged by deploy/vast/build.sh, never committed (700 MB of model weights)
 deploy/vast/checkpoints/
 
