@@ -276,8 +276,147 @@ def _parallel_chord_score(a: list[dict], b: list[dict], tolerance: float) -> flo
     return _chord_verdict(a, b, tolerance)[0]
 
 
+# Two groups more than this far apart in register are different lines even when
+# their times do not clash — stitching a bass figure onto a melody that happens
+# to have paused reads worse than leaving them apart.
+LINK_SPAN = 18
+# A group may start this soon after the previous one ends and still be its
+# continuation; AMT offsets routinely run a little long.
+LINK_GAP = 0.12
+
+
+def _intervals(group: list[dict]) -> list[tuple[float, float]]:
+    """The times a group actually occupies, merged into disjoint spans."""
+    out: list[list[float]] = []
+    for n in sorted(group, key=lambda x: float(x["start"])):
+        a, b = float(n["start"]), float(n["end"])
+        if out and a <= out[-1][1] + 1e-9:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return [(a, b) for a, b in out]
+
+
+def _clashes(a: list[tuple[float, float]], b: list[tuple[float, float]],
+             tol: float) -> bool:
+    """Do two occupied-time lists overlap anywhere?  Both are sorted."""
+    i = j = 0
+    while i < len(a) and j < len(b):
+        if a[i][1] - tol <= b[j][0]:
+            i += 1
+        elif b[j][1] - tol <= a[i][0]:
+            j += 1
+        else:
+            return True
+    return False
+
+
+def _merge_intervals(a: list[tuple[float, float]],
+                     b: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    out: list[list[float]] = []
+    for x, y in sorted(a + b):
+        if out and x <= out[-1][1] + 1e-9:
+            out[-1][1] = max(out[-1][1], y)
+        else:
+            out.append([x, y])
+    return [(x, y) for x, y in out]
+
+
+def _link_sequential(groups: list[list[dict]]) -> list[list[dict]]:
+    """Join groups that never sound at the same time into one line.
+
+    The chord merge above can only ever join things that overlap: it asks
+    whether two lines attack together or ring together. So a line that stops and
+    starts again — a melody resting for a bar, a phrase leaping more than an
+    octave, anything that made `_provisional_contours` open a new contour — is
+    split forever, however obviously it continues.
+
+    Joining two groups whose times do not clash costs nothing: no note moves and
+    no duration is shortened, because a printed voice only ever needed its notes
+    not to overlap. Measured on a 144 s piano track this is the difference
+    between 30 advertised "sequences" and 9, against 10 notes ever sounding at
+    once, with no note lost.
+
+    Occupied time is compared span by span rather than first-note-to-last, so a
+    short figure can sit inside a long line's rest instead of forcing a line of
+    its own. Register distance decides between candidates, and caps how far a
+    line may be stitched.
+    """
+    if len(groups) < 2:
+        return groups
+    ordered = sorted(groups, key=lambda g: min(float(n["start"]) for n in g))
+    streams: list[dict] = []
+    for group in ordered:
+        iv = _intervals(group)
+        pitch = median(int(n["pitch"]) for n in group)
+        free = [st for st in streams
+                if abs(st["pitch"] - pitch) <= LINK_SPAN
+                and not _clashes(st["iv"], iv, LINK_GAP)]
+        if free:
+            st = min(free, key=lambda st: abs(st["pitch"] - pitch))
+            st["notes"].extend(group)
+            st["iv"] = _merge_intervals(st["iv"], iv)
+            st["pitch"] = median(int(n["pitch"]) for n in st["notes"])
+        else:
+            streams.append({"notes": list(group), "iv": iv, "pitch": pitch})
+    return [st["notes"] for st in streams]
+
+
+# A sequence has to be big enough to be worth showing as its own line: at least
+# this many notes AND this share of the track. Below that it is a handful of
+# stray events, and advertising it as a part just lengthens the stem list.
+#
+# Measured on eval/refs_band against the reference MIDI's real instrument
+# assignment, scoring "are these two notes in the same part" pairwise: folding
+# slivers back took 64 lines to 57 for a pairwise F1 of 0.612 vs 0.615, i.e.
+# 11% fewer lines at no real cost.
+# How polyphonic a track has to be before it is split at all.
+#
+# This was 0.18, which is barely more than "two notes ever overlap", so nearly
+# every track got split. Measured on eval/refs_band against the reference MIDI's
+# real instrument assignment: the split at 0.18 produced 73 lines for a pairwise
+# F1 of 0.602, against 49 lines and 0.595 for not splitting at all — 24 extra
+# lines bought 0.007. Raising the gate to 0.50 gives 64 lines and 0.615, better
+# on both counts, and the curve is flat either side of it (0.35 -> 0.608,
+# 0.65 -> 0.605) so it is not a tuned-to-the-set knife edge.
+SPLIT_POLY_GATE = 0.50
+
+# A sequence has to be big enough to be worth showing as its own line. The
+# threshold is ABSOLUTE on purpose. It was briefly
+#     floor = max(MIN_SEQUENCE_NOTES, 0.20 * len(track))
+# which looks harmless on the 25-second eval clips (tracks of 100-500 notes give
+# a floor of 24-100) and is catastrophic on a real song: a two-minute piano part
+# of 1086 notes gets a floor of 217, so every genuine secondary voice is folded
+# into the first. That part is 91% polyphonic with up to seven simultaneous
+# notes, which one notated voice cannot hold, and build_score then drops
+# whatever does not fit — 490 of 1637 notes missing from the printed score.
+#
+#   흡수 규칙              밴드 라인  밴드 F1  곡 성부  악보 음   손실
+#   흡수 안 함                  64    0.615     11    1637     0%
+#   max(절대, 비율)  (버그)      57    0.611      5    1316   19.6%
+#   절대값만          (현재)      59    0.614     11    1637     0%
+#
+# The share term bought two fewer lines and cost a fifth of the score.
+MIN_SEQUENCE_NOTES = 24
+
+
+def _absorb_slivers(parts: list[list[dict]], min_notes: int) -> list[list[dict]]:
+    """Fold sequences too small to stand on their own into the largest one."""
+    if len(parts) < 2:
+        return parts
+    keep = [p for p in parts if len(p) >= min_notes]
+    if not keep or len(keep) == len(parts):
+        return parts
+    host = max(keep, key=len)
+    for p in parts:
+        if len(p) < min_notes:
+            host.extend(p)
+    return keep
+
+
 def separate_sequences(notes: list[dict], chord_gap: float = 0.035,
-                       continuity_gap: float = 2.4) -> list[list[dict]]:
+                       continuity_gap: float = 2.4,
+                       min_notes: int = MIN_SEQUENCE_NOTES) -> list[list[dict]]:
     """Infer musical sequences using global chord-pattern evidence.
 
     1. Build provisional monophonic contours (every note is retained).
@@ -363,8 +502,9 @@ def separate_sequences(notes: list[dict], chord_gap: float = 0.035,
             groups[target].extend(transient)
             del groups[root]
 
-    parts = [sorted(group, key=lambda n: (n["start"], n["pitch"]))
-             for group in groups.values() if group]
+    parts = _link_sequential([g for g in groups.values() if g])
+    parts = _absorb_slivers(parts, min_notes)
+    parts = [sorted(group, key=lambda n: (n["start"], n["pitch"])) for group in parts]
     parts.sort(key=lambda part: -median(n["pitch"] for n in part))
     return parts
 

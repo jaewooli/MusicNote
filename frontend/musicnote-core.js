@@ -372,7 +372,8 @@ function drawRoll(d) {
 // then silence" that happened when everything was queued before ctx.resume()).
 const Player = {
   ctx: null, notes: [], dur: 0, pos: 0, playing: false,
-  _master: null, _startCtx: 0, _startPos: 0, _next: 0, _timer: 0, _raf: 0, _osc: [],
+  _master: null, _limit: null, _startCtx: 0, _startPos: 0, _next: 0, _timer: 0, _raf: 0, _osc: [],
+  _wv: null, _wi: 0,
   _ac() {
     if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)();
     return this.ctx;
@@ -395,6 +396,57 @@ const Player = {
     this._osc.forEach(o => { try { o.stop(); } catch (_) {} });
     this._osc = [];
     if (this._master) { try { this._master.disconnect(); } catch (_) {} this._master = null; }
+    if (this._limit) { try { this._limit.disconnect(); } catch (_) {} this._limit = null; }
+  },
+  // One PeriodicWave per pool slot, partials at 1/2/3 with the same amplitudes
+  // the three oscillators used to have, but each partial given a random phase.
+  //
+  // Why: every OscillatorNode starts at phase 0, so two notes an octave apart
+  // put an identical component (the lower note's 2nd partial, the upper note's
+  // fundamental) on the bus perfectly in phase and it adds coherently. Measured
+  // with BS.1770 K-weighting, an octave doubling was +4.5 dB over the note alone
+  // and a unison was +6.0 dB — the sound of one voice suddenly jumping out. On
+  // MT3 output 38% of notes are in a simultaneous octave and 21% in a unison, so
+  // this was firing constantly. Randomising the phase drops the octave case to
+  // +3.2 dB and the unison to +1.6 dB, which is what acoustic instruments do.
+  //
+  // A fixed pool, indexed per note, keeps this deterministic across replays and
+  // costs one PeriodicWave per slot instead of one per note.
+  _waves() {
+    if (this._wv) return this._wv;
+    const amp = [0, 1.0, 0.35, 0.16];
+    this._wv = [];
+    for (let i = 0; i < 12; i++) {
+      const re = new Float32Array(amp.length), im = new Float32Array(amp.length);
+      for (let k = 1; k < amp.length; k++) {
+        // deterministic per (slot, partial) so a replay sounds identical
+        const ph = 2 * Math.PI * ((Math.sin(i * 12.9898 + k * 78.233) * 43758.5453) % 1);
+        re[k] = amp[k] * Math.sin(ph);      // cos term
+        im[k] = amp[k] * Math.cos(ph);      // sin term
+      }
+      // no normalisation: it divides by peak amplitude, which differs per phase
+      // set, and would hand each slot a different loudness
+      this._wv.push(this.ctx.createPeriodicWave(re, im, { disableNormalization: true }));
+    }
+    return this._wv;
+  },
+  // Equal digital gain is not equal loudness. Measured on this exact partial
+  // stack with BS.1770 K-weighting, relative to C4: a note is quieter down low
+  // and louder up high, by up to +3.4 dB at C7. Left uncorrected, a spurious
+  // octave-up note is louder than the real note it doubles purely because it is
+  // higher. Table is the measurement; linear interpolation between points.
+  _tilt(midi) {
+    const T = [[36, -2.10], [48, -0.49], [60, 0.00], [72, 0.31], [84, 1.33], [96, 3.42]];
+    const m = Math.max(T[0][0], Math.min(T[T.length - 1][0], midi));
+    let d = T[T.length - 1][1];
+    for (let i = 1; i < T.length; i++) {
+      if (m <= T[i][0]) {
+        const f = (m - T[i - 1][0]) / (T[i][0] - T[i - 1][0]);
+        d = T[i - 1][1] + f * (T[i][1] - T[i - 1][1]);
+        break;
+      }
+    }
+    return Math.pow(10, -d / 20);
   },
   _voice(n) {
     const ac = this.ctx;
@@ -402,7 +454,8 @@ const Player = {
     const end = this._startCtx + (n.end - this._startPos);
     if (end <= ac.currentTime + 0.01) return;
     const dur = Math.max(0.03, end - when);
-    const vpk = 0.045 + 0.5 * Math.pow((n.velocity || 90) / 127, 1.35);   // peak gain
+    const vpk = (0.045 + 0.5 * Math.pow((n.velocity || 90) / 127, 1.35))
+              * this._tilt(n.pitch != null ? n.pitch : 60);          // peak gain
     // per-note amplitude envelope from the backend (10-pt, own-peak-normalised),
     // so struck-and-decaying / swelling notes actually sound that way
     const e = (Array.isArray(n.env) && n.env.length >= 2)
@@ -419,13 +472,13 @@ const Player = {
     }
     g.gain.linearRampToValueAtTime(1e-4, tail);                  // clean tail
     g.connect(this._master);
-    [[1, 1.0], [2, 0.35], [3, 0.16]].forEach(([m, a]) => {
-      const o = ac.createOscillator(), pg = ac.createGain();
-      o.type = 'sine'; o.frequency.value = n.freq * m; pg.gain.value = a;
-      o.connect(pg).connect(g);
-      o.start(when); o.stop(tail + 0.02);
-      this._osc.push(o);
-    });
+    const wv = this._waves();
+    const o = ac.createOscillator();
+    o.setPeriodicWave(wv[(this._wi = (this._wi + 1) % wv.length)]);
+    o.frequency.value = n.freq;
+    o.connect(g);
+    o.start(when); o.stop(tail + 0.02);
+    this._osc.push(o);
   },
   _pump() {
     if (!this.playing) return;
@@ -443,7 +496,15 @@ const Player = {
       this.pos = this._startPos;
       this._startCtx = ac.currentTime + 0.08;
       this._master = ac.createGain(); this._master.gain.value = 0.5;
-      this._master.connect(ac.destination);
+      // Notes sum linearly with nothing catching the peak: measured, an
+      // eight-note chord at velocity 100 reaches 1.008 and clips, which is heard
+      // as a harsh blare on exactly the dense bars. A limiter costs a little
+      // level on those bars instead.
+      this._limit = ac.createDynamicsCompressor();
+      this._limit.threshold.value = -6; this._limit.knee.value = 3;
+      this._limit.ratio.value = 12; this._limit.attack.value = 0.003;
+      this._limit.release.value = 0.25;
+      this._master.connect(this._limit).connect(ac.destination);
       this._next = this.notes.findIndex(n => n.start >= this._startPos - 0.02);
       if (this._next < 0) this._next = this.notes.length;
       this.playing = true;
@@ -455,7 +516,11 @@ const Player = {
     };
     if (ac.state === 'suspended') ac.resume().then(go, go); else go();
   },
-  play() { if (!this.playing && this.notes.length) this._begin(); },
+  play() {
+    if (this.playing || !this.notes.length) return;
+    ROLL_PINNED = false;        // pressing play asks to follow again
+    this._begin();
+  },
   pause() { if (this.playing) { this.pos = this.now(); this._halt(); this.playing = false; transportState(false); transportFrame(this.pos, this.dur); } },
   toggle() { this.playing ? this.pause() : this.play(); },
   stop() { this._halt(); this.playing = false; this.pos = 0; transportState(false); transportFrame(0, this.dur); },
@@ -497,23 +562,12 @@ function transportFrame(t, dur) {
 })();
 
 // ---- playhead on the roll + the score --------------------------------------
-// Keep `px` visible inside whichever box actually scrolls. The result page
-// draws the score into a box that grows instead of scrolling, so following the
-// playhead there means scrolling the window; the editor and the full-score page
-// scroll their own container.
-function _follow(el, px, py, h) {
-  if (el && el.scrollWidth > el.clientWidth + 4) {
-    if (px < el.scrollLeft + 20 || px > el.scrollLeft + el.clientWidth - 30)
-      el.scrollLeft = Math.max(0, px - el.clientWidth * 0.3);
-  }
-  if (el && el.scrollHeight > el.clientHeight + 4) {
-    if (py < el.scrollTop + 10 || py + h > el.scrollTop + el.clientHeight - 10)
-      el.scrollTop = Math.max(0, py - el.clientHeight * 0.35);
-    return;
-  }
-  return true;      // container did not scroll vertically — caller may pan the page
-}
-
+// The playhead moves; the page does not. Dragging the view away from the
+// playhead is a deliberate act — reading a bar that just went past, or one
+// coming up — and yanking it back every frame makes the score unusable during
+// playback. The piano roll is the one exception: it is a single strip that is
+// always wider than its window, so following there is the only way to see the
+// note being played.
 const Playhead = {
   move(t) {
     const rh = $('#rollHead');
@@ -521,7 +575,7 @@ const Playhead = {
       const x = t * ROLL.pxPerSec;
       rh.hidden = !Player.playing && t <= 0;
       rh.style.transform = 'translateX(' + x + 'px)';
-      if (Player.playing) {
+      if (Player.playing && !ROLL_PINNED) {
         const wrap = $('#pianoWrap');
         const want = x - wrap.clientWidth * 0.35;
         if (want > wrap.scrollLeft || x > wrap.scrollLeft + wrap.clientWidth - 40)
@@ -537,17 +591,23 @@ const Playhead = {
     sh.style.left = hit.x + 'px';
     sh.style.top = m.y + 'px';
     sh.style.height = m.h + 'px';
-    if (!Player.playing) return;
-    const box = $('#score') || $('#fullScore') || $('#scoreSvg');
-    if (_follow(box, hit.x, m.y, m.h)) {
-      // the box itself is not scrollable vertically: pan the page instead, so a
-      // score that wraps onto many systems still follows the music
-      const r = sh.getBoundingClientRect();
-      if (r.top < 80 || r.bottom > window.innerHeight - 60)
-        window.scrollBy({ top: r.top - window.innerHeight * 0.3, behavior: 'instant' });
-    }
   },
 };
+
+// Scrolling the roll by hand stops it following, until playback is restarted.
+let ROLL_PINNED = false;
+(function wireRollPin() {
+  const bind = () => {
+    const wrap = $('#pianoWrap');
+    if (!wrap || wrap._pinBound) return;
+    wrap._pinBound = true;
+    ['wheel', 'pointerdown', 'touchstart'].forEach(ev =>
+      wrap.addEventListener(ev, () => { ROLL_PINNED = true; }, { passive: true }));
+  };
+  if (document.readyState === 'loading')
+    document.addEventListener('DOMContentLoaded', bind);
+  else bind();
+})();
 
 // ---- click the score to move the playback position -------------------------
 // Bound on the wrapper (not the SVG) so it survives every re-render.
@@ -653,12 +713,18 @@ const SHARP_LET = ['c', 'c', 'd', 'd', 'e', 'f', 'f', 'g', 'g', 'a', 'a', 'b'];
 const SHARP_AL = ['', '#', '', '#', '', '', '#', '', '#', '', '#', ''];
 const FLAT_LET = ['c', 'd', 'd', 'e', 'e', 'f', 'g', 'g', 'a', 'a', 'b', 'b'];
 const FLAT_AL = ['', 'b', '', 'b', '', '', 'b', '', 'b', '', 'b', ''];
+// Every signature the score builder can choose (score_model._FIFTHS_PCS spans
+// six flats to six sharps). A key missing here silently prints as C, which puts
+// an accidental on every note of a piece in D-flat.
 const KEYSIG = {
   C: { t: null, s: new Set() }, G: { t: '#', s: new Set([6]) },
   D: { t: '#', s: new Set([6, 1]) }, A: { t: '#', s: new Set([6, 1, 8]) },
   E: { t: '#', s: new Set([6, 1, 8, 3]) }, B: { t: '#', s: new Set([6, 1, 8, 3, 10]) },
+  'F#': { t: '#', s: new Set([6, 1, 8, 3, 10, 5]) },
   F: { t: 'b', s: new Set([10]) }, Bb: { t: 'b', s: new Set([10, 3]) },
   Eb: { t: 'b', s: new Set([10, 3, 8]) }, Ab: { t: 'b', s: new Set([10, 3, 8, 1]) },
+  Db: { t: 'b', s: new Set([10, 3, 8, 1, 6]) },
+  Gb: { t: 'b', s: new Set([10, 3, 8, 1, 6, 11]) },
 };
 const MINOR_TO_MAJOR = { A: 'C', E: 'G', B: 'D', 'F#': 'A', 'C#': 'E', D: 'F', G: 'Bb', C: 'Eb', F: 'Ab' };
 function effectiveKey(d) {
@@ -703,7 +769,8 @@ const Score = {
       params.num = ts[0]; params.den = ts[1]; params.tempo = curTempo();
       const key = $('#keySel');
       if (key && key.value !== 'auto') {
-        const fifths = { C: 0, G: 1, D: 2, A: 3, E: 4, B: 5, F: -1, Bb: -2, Eb: -3, Ab: -4 };
+        const fifths = { C: 0, G: 1, D: 2, A: 3, E: 4, B: 5, 'F#': 6,
+          F: -1, Bb: -2, Eb: -3, Ab: -4, Db: -5, Gb: -6 };
         params.fifths = fifths[key.value] ?? 0;
       }
       fetchScoreDoc(d.job_id, params).then(doc => {
@@ -845,19 +912,104 @@ const VF_DUR = {
 };
 const VF_ACC = { 1: '#', 2: '##', '-1': 'b', '-2': 'bb' };
 
+// VexFlow notehead glyphs, appended to a key as `g/5/x2`.
+const VF_HEAD = { x: 'x2', 'circle-x': 'cx', diamond: 'd2' };
+
 function _vfKey(n) {
+  // A drum note's step/octave is the line it sits on, not a pitch, and `midi`
+  // is the kit piece. No accidental can apply, and the piece picks the head.
+  if (n.unpitched) {
+    const head = VF_HEAD[n.notehead];
+    return n.step.toLowerCase() + '/' + n.octave + (head ? '/' + head : '');
+  }
   const acc = n.alter > 0 ? '#'.repeat(n.alter) : n.alter < 0 ? 'b'.repeat(-n.alter) : '';
   return n.step.toLowerCase() + acc + '/' + n.octave;
 }
 
-// Rest lines for a staff carrying two voices: the upper voice's rests sit
-// above the middle line, the lower voice's below, so they stop colliding.
+// Rest lines for a staff carrying more than one voice: the upper voice's rests
+// sit above the middle line, the lower voice's below, so they stop colliding.
+// A third voice is allowed now (score_build.VOICE_OVERFLOW_LIMIT), and it needs
+// a line of its own — sharing the lower voice's put two rests on top of each
+// other, which reads as one.
 const REST_KEY = {
   treble: ['d/5', 'f/4'], bass: ['f/3', 'b/2'],
 };
-function _restKey(clef, vi, two) {
-  const pair = REST_KEY[clef] || REST_KEY.treble;
-  return two ? pair[Math.min(vi, 1)] : (clef === 'bass' ? 'd/3' : 'b/4');
+const REST_KEY_3 = {
+  treble: ['e/5', 'b/4', 'e/4'], bass: ['g/3', 'd/3', 'g/2'],
+};
+function _restKey(clef, vi, count) {
+  if (count > 2) {
+    const three = REST_KEY_3[clef] || REST_KEY_3.treble;
+    return three[Math.min(vi, three.length - 1)];
+  }
+  if (count > 1) {
+    const pair = REST_KEY[clef] || REST_KEY.treble;
+    return pair[Math.min(vi, 1)];
+  }
+  return clef === 'bass' ? 'd/3' : 'b/4';
+}
+
+// Move each voice's rests clear of the other voice's notes.
+//
+// Engraving convention: the upper voice rests above what the lower voice is
+// doing, the lower voice rests below. VexFlow's own `align_rests` does not do
+// this — it aligns a rest to its OWN voice's notes, and measured over 2356
+// drawn tickables it changed nothing here.
+//
+// Measured alternatives, same piece: doing this against the drawn bounding
+// boxes after formatting looked more principled and came out worse (5 clashes
+// against 2), because one rest pushed clear of the note it overlapped landed on
+// the next one. Staff lines before formatting is what actually works.
+const REST_LINE_MIN = -1, REST_LINE_MAX = 5;
+
+function _spaceRests(voices) {
+  if (voices.length < 2) return;
+  const spans = voices.map(v => {
+    const out = [];
+    let t = 0;
+    v.getTickables().forEach(n => {
+      const dur = (n._ev && n._ev.dur) || 0;
+      if (!n.isRest()) {
+        const lines = n.getKeyProps().map(k => k.line);
+        out.push([t, t + dur, Math.min(...lines), Math.max(...lines)]);
+      }
+      t += dur;
+    });
+    return out;
+  });
+  voices.forEach((v, vi) => {
+    let t = 0;
+    v.getTickables().forEach(n => {
+      const dur = (n._ev && n._ev.dur) || 0;
+      if (n.isRest()) {
+        let lo = null, hi = null;
+        spans.forEach((sp, k) => {
+          if (k === vi) return;
+          sp.forEach(([a2, b2, l, h]) => {
+            if (a2 < t + dur && b2 > t) {
+              lo = lo === null ? l : Math.min(lo, l);
+              hi = hi === null ? h : Math.max(hi, h);
+            }
+          });
+        });
+        let line = n.getKeyProps()[0].line, move = false;
+        if (hi !== null) {
+          line = vi === 0 ? Math.max(3, hi + 1.5) : Math.min(1, lo - 1.5);
+          move = true;
+        } else if (line < REST_LINE_MIN || line > REST_LINE_MAX) {
+          // Nothing clashes, but the rest is several ledger lines off the
+          // staff. Bring it back; pulling in rests that are already on the
+          // staff measured worse, so only the strays are touched.
+          line = Math.max(REST_LINE_MIN, Math.min(REST_LINE_MAX, line));
+          move = true;
+        }
+        if (move) {
+          try { n.setKeyLine(0, Math.max(-2.5, Math.min(7.5, line))); } catch (_) {}
+        }
+      }
+      t += dur;
+    });
+  });
 }
 
 function renderDoc(box, doc, opts) {
@@ -917,6 +1069,7 @@ function renderDoc(box, doc, opts) {
         const show = live.length ? live
           : src.filter(v => v.measures[mi] && v.measures[mi].events.length).slice(0, 1);
         const two = show.length > 1;
+        const nVoices = show.length;
         const row = { clef, part: p, voices: [], tuplets: [], ties: [] };
         show.forEach((v, vi) => {
           const dir = two ? (vi === 0 ? VF.Stem.UP : VF.Stem.DOWN) : null;
@@ -925,14 +1078,14 @@ function renderDoc(box, doc, opts) {
             const code = VF_DUR[e.type] || 'q';
             let n;
             if (!e.notes || !e.notes.length) {
-              n = new VF.StaveNote({ clef, keys: [_restKey(clef, vi, two)],
+              n = new VF.StaveNote({ clef, keys: [_restKey(clef, vi, nVoices)],
                 duration: code + 'r' });
             } else {
               n = new VF.StaveNote({ clef, keys: e.notes.map(_vfKey), duration: code });
-              e.notes.forEach((nn, i) => {
-                if (nn.alter && VF_ACC[nn.alter])
-                  n.addModifier(new VF.Accidental(VF_ACC[nn.alter]), i);
-              });
+              // Accidentals are NOT added here. VexFlow's applyAccidentals
+              // works out which ones the key signature and the rest of the bar
+              // actually require, so a bar in A flat stops repeating a flat on
+              // every note of it. Applied once per staff, below.
               if (e.notes.some(nn => nn.conf !== undefined && nn.conf < 0.5))
                 n.setStyle({ fillStyle: '#c85f3b', strokeStyle: '#c85f3b' });
               if (dir !== null) n.setStemDirection(dir);
@@ -970,6 +1123,12 @@ function renderDoc(box, doc, opts) {
           }
         });
         if (row.voices.length) {
+          // Before measuring: an accidental takes width, so deciding them after
+          // the width is measured leaves the bar too narrow for its own notes.
+          if (clef !== 'percussion') {
+            try { VF.Accidental.applyAccidentals(row.voices, keyName); } catch (_) {}
+          }
+          _spaceRests(row.voices);
           try {
             const f = new VF.Formatter().joinVoices(row.voices);
             minW = Math.max(minW, f.preCalculateMinTotalWidth(row.voices));
@@ -990,8 +1149,10 @@ function renderDoc(box, doc, opts) {
     parts.forEach(p => {
       for (let si = 0; si < nStaves(p); si++) {
         const st = new VF.Stave(0, 0, 300);
-        st.addClef(clefOf(p, si));
-        if (keyName !== 'C') st.addKeySignature(keyName);
+        const probeClef = clefOf(p, si);
+        st.addClef(probeClef);
+        if (keyName !== 'C' && probeClef !== 'percussion')
+          st.addKeySignature(keyName);
         if (withTime) st.addTimeSignature(tsStr);
         try { w = Math.max(w, st.getNoteStartX()); } catch (_) { w = Math.max(w, 90); }
       }
@@ -1054,7 +1215,9 @@ function renderDoc(box, doc, opts) {
           const st = new VF.Stave(x, sysY + row * staffH, sw);
           if (col === 0) {
             st.addClef(r.clef);
-            if (keyName !== 'C') st.addKeySignature(keyName);
+            // A percussion staff's lines are positions, not pitches: no key.
+            if (keyName !== 'C' && r.clef !== 'percussion')
+              st.addKeySignature(keyName);
             if (mi === 0) st.addTimeSignature(tsStr);
           }
           st.setContext(ctx).draw();
@@ -1069,6 +1232,9 @@ function renderDoc(box, doc, opts) {
           }
           if (!r.voices.length) continue;
           const inner = Math.max(40, st.getNoteEndX() - st.getNoteStartX() - 8);
+          // No align_rests: measured over 2356 drawn tickables it changed
+          // nothing, because it aligns a rest to its own voice's notes. Rest
+          // placement is handled by _spaceRests, which looks at the other one.
           try {
             new VF.Formatter().joinVoices(r.voices).format(r.voices, inner);
           } catch (_) {
@@ -1089,7 +1255,11 @@ function renderDoc(box, doc, opts) {
           const beams = [];
           r.voices.forEach(v => {
             try {
-              const bo = { groups: beamGroups, beam_rests: false };
+              // Drum beams are drawn flat. The staff's lines are kit pieces,
+              // not pitches, so a sloped beam would suggest a melodic contour
+              // that a hi-hat over a kick does not have.
+              const bo = { groups: beamGroups, beam_rests: false,
+                flat_beams: r.clef === 'percussion' };
               if (v._dir !== null) {
                 bo.stem_direction = v._dir;
                 bo.maintain_stem_directions = true;
@@ -1225,8 +1395,8 @@ function scoreTimeAt(px, py) {
 }
 
 function fifthsToKey(f) {
-  return ({ 0: 'C', 1: 'G', 2: 'D', 3: 'A', 4: 'E', 5: 'B',
-    '-1': 'F', '-2': 'Bb', '-3': 'Eb', '-4': 'Ab' })[f] || 'C';
+  return ({ 0: 'C', 1: 'G', 2: 'D', 3: 'A', 4: 'E', 5: 'B', 6: 'F#',
+    '-1': 'F', '-2': 'Bb', '-3': 'Eb', '-4': 'Ab', '-5': 'Db', '-6': 'Gb' })[f] || 'C';
 }
 
 async function fetchScoreDoc(jobId, params) {

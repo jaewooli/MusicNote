@@ -45,8 +45,9 @@
       <select id="keySel">
         <option value="auto">자동</option>
         <option>C</option><option>G</option><option>D</option><option>A</option>
-        <option>E</option><option>B</option><option>F</option>
-        <option>Bb</option><option>Eb</option><option>Ab</option>
+        <option>E</option><option>B</option><option>F#</option>
+        <option>F</option><option>Bb</option><option>Eb</option>
+        <option>Ab</option><option>Db</option><option>Gb</option>
       </select>
     </label>
     <label class="field">박자표
@@ -86,7 +87,8 @@ function fsParts() {
   return [{ label: '', notes: r.notes || [] }];
 }
 
-const KEY_FIFTHS = { C: 0, G: 1, D: 2, A: 3, E: 4, B: 5, F: -1, Bb: -2, Eb: -3, Ab: -4 };
+const KEY_FIFTHS = { C: 0, G: 1, D: 2, A: 3, E: 4, B: 5, 'F#': 6,
+  F: -1, Bb: -2, Eb: -3, Ab: -4, Db: -5, Gb: -6 };
 let drawSeq = 0;
 
 async function draw() {

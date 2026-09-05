@@ -34,9 +34,15 @@ def _note_xml(n, dur: int, ty: str, dots: int, tup, tup_start: bool,
     bits = ["<note>"]
     if chord:
         bits.append("<chord/>")
-    alter = f"<alter>{n.alter}</alter>" if n.alter else ""
-    bits.append(f"<pitch><step>{n.step}</step>{alter}"
-                f"<octave>{n.octave}</octave></pitch>")
+    if n.unpitched:
+        # A kit piece, not a pitch. <unpitched> names the line to draw it on and
+        # nothing else, so no <alter> and no accidental from the key signature.
+        bits.append(f"<unpitched><display-step>{n.step}</display-step>"
+                    f"<display-octave>{n.octave}</display-octave></unpitched>")
+    else:
+        alter = f"<alter>{n.alter}</alter>" if n.alter else ""
+        bits.append(f"<pitch><step>{n.step}</step>{alter}"
+                    f"<octave>{n.octave}</octave></pitch>")
     bits.append(f"<duration>{dur}</duration>")
     if n.tie_stop:
         bits.append('<tie type="stop"/>')
@@ -45,6 +51,8 @@ def _note_xml(n, dur: int, ty: str, dots: int, tup, tup_start: bool,
     bits.append(f"<voice>{voice}</voice>")
     bits.append(f"<type>{ty}</type>")
     bits.append("<dot/>" * dots)
+    if n.notehead and n.notehead != "normal":
+        bits.append(f"<notehead>{n.notehead}</notehead>")
     if tup:
         bits.append(f"<time-modification><actual-notes>{tup[0]}</actual-notes>"
                     f"<normal-notes>{tup[1]}</normal-notes></time-modification>")
@@ -80,7 +88,8 @@ def doc_to_musicxml(doc: ScoreDoc) -> str:
                    f'<score-instrument id="{p.id}-I"><instrument-name>'
                    f'{escape(p.name)}</instrument-name></score-instrument>'
                    f'<midi-instrument id="{p.id}-I">'
-                   f'<midi-program>{int(p.program) + 1}</midi-program>'
+                   + ("<midi-channel>10</midi-channel>" if p.is_drum else "")
+                   + f'<midi-program>{int(p.program) + 1}</midi-program>'
                    f'</midi-instrument></score-part>')
     out.append('</part-list>')
 
@@ -93,16 +102,21 @@ def doc_to_musicxml(doc: ScoreDoc) -> str:
                 clefs = list(p.clefs or [p.clef])[:max(1, p.staves)]
                 while len(clefs) < max(1, p.staves):
                     clefs.append(p.clef)
+                signs = {"bass": "<sign>F</sign><line>4</line>",
+                         "percussion": "<sign>percussion</sign><line>2</line>",
+                         "treble": "<sign>G</sign><line>2</line>"}
                 cx = "".join(
                     f'<clef number="{i + 1}">'
-                    + ("<sign>F</sign><line>4</line>" if c == "bass"
-                       else "<sign>G</sign><line>2</line>")
-                    + "</clef>"
+                    + signs.get(c, signs["treble"]) + "</clef>"
                     for i, c in enumerate(clefs))
                 staves = (f'<staves>{p.staves}</staves>' if p.staves > 1 else "")
+                # A percussion staff carries no key: its lines are positions,
+                # not pitches, so a key signature there is meaningless.
+                key = ("" if p.is_drum
+                       else f'<key><fifths>{doc.key_fifths}</fifths></key>')
                 out.append(
                     f'<attributes><divisions>{doc.divisions}</divisions>'
-                    f'<key><fifths>{doc.key_fifths}</fifths></key>'
+                    f'{key}'
                     f'<time><beats>{doc.time_sig[0]}</beats>'
                     f'<beat-type>{doc.time_sig[1]}</beat-type></time>'
                     f'{staves}{cx}</attributes>')
