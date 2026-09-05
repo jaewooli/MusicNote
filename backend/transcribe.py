@@ -852,6 +852,63 @@ def drum_hit_profile(y: np.ndarray, sr: int, notes: list[dict],
     return out
 
 
+def drum_hit_sample(y: np.ndarray, sr: int, notes: list[dict], sample: int = 8,
+                    clip_s: float = 0.35) -> dict[str, str]:
+    """One real audio clip per GM kit piece — base64 WAV, picked from this
+    recording's own cleanest onset of that piece — so playback IS this song's
+    own kick/snare/hihat, not a synthesised guess at one. Measuring timbre
+    (drum_hit_profile above) and then re-synthesising from the measurement
+    both lose information a direct clip doesn't: this replaces that guess
+    with the real thing wherever a clean-enough onset exists.
+
+    "Cleanest" = the onset with the highest ratio of its own immediate energy
+    to whatever was already sounding just before it. MT3 mode has no isolated
+    drum audio, so an onset landing on top of a lot of already-present
+    content is more likely to hand back a clip dominated by other
+    instruments, not the drum itself — this picks the least contaminated
+    instance available rather than just the first or the loudest.
+    """
+    import base64
+    import io
+    import soundfile as sf
+
+    by_pitch: dict[int, list[dict]] = {}
+    for n in notes:
+        by_pitch.setdefault(int(n["pitch"]), []).append(n)
+    clip_len = int(clip_s * sr)
+    pre_len = int(0.03 * sr)
+    post_len = min(clip_len, int(0.05 * sr))
+    out: dict[str, str] = {}
+    for pitch, ns in by_pitch.items():
+        pick = ns if len(ns) <= sample else [
+            ns[i] for i in np.linspace(0, len(ns) - 1, sample).round().astype(int)]
+        best_i0, best_score = None, -1.0
+        for n in pick:
+            i0 = int(round(float(n["start"]) * sr))
+            if i0 < pre_len or i0 + clip_len > len(y):
+                continue
+            pre = y[i0 - pre_len:i0]
+            post = y[i0:i0 + post_len]
+            pre_e = float(np.sqrt(np.mean(pre ** 2))) + 1e-6
+            post_e = float(np.sqrt(np.mean(post ** 2))) + 1e-6
+            score = post_e / pre_e
+            if score > best_score:
+                best_score, best_i0 = score, i0
+        if best_i0 is None:
+            continue
+        clip = y[best_i0:best_i0 + clip_len].copy()
+        # A short fade at each edge so the clip itself doesn't click on loop-in
+        # or cut-off — this is about the SPLICE, not the drum's own decay.
+        fade = min(int(0.005 * sr), clip.size // 4)
+        if fade > 1:
+            clip[:fade] *= np.linspace(0.0, 1.0, fade, dtype=clip.dtype)
+            clip[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=clip.dtype)
+        buf = io.BytesIO()
+        sf.write(buf, clip, sr, format="WAV", subtype="PCM_16")
+        out[str(pitch)] = base64.b64encode(buf.getvalue()).decode("ascii")
+    return out
+
+
 def _note_dynamics(notes: list[dict], a: dict, field: str = "velocity",
                    override: bool | None = None) -> list[dict]:
     """Give every note a real loudness + a per-note amplitude envelope, read from

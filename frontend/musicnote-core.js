@@ -133,6 +133,15 @@ function showResult(r) {
 
 function stemFor(r, id) { return (r.stems || []).find(s => s.id === id); }
 
+// {pitch: base64 WAV} merged across every stem that has one — normally just
+// the one drum stem, but merging rather than picking the first stem keeps
+// this correct if that ever changes. See backend/transcribe.drum_hit_sample.
+function drumSamplesFrom(r) {
+  const out = {};
+  (r && r.stems || []).forEach((s) => Object.assign(out, s.drum_samples || {}));
+  return out;
+}
+
 function stemView(r, id) {
   const s = stemFor(r, id) || {};
   // A single stem is one instrument throughout, so tag its notes with that
@@ -275,6 +284,10 @@ function renderCommon(d, fromRefine) {
   const sw = $('#synthWrap');
   if (sw) sw.style.display = (d.notes && d.notes.length) ? '' : 'none';
   Player.setNotes(d.notes || [], d.duration || 0);   // instant — no re-render
+  // LAST, not d: renderCommon also runs for a single-stem sub-view (stemView's
+  // shape has no top-level .stems), and that must not wipe out samples already
+  // decoded from the full result just because one stem is being viewed.
+  Player.setDrumSamples(drumSamplesFrom(LAST || d));
   bindRoll();
   drawRoll(d);
   Score.render(d);
@@ -389,7 +402,7 @@ function drawRoll(d) {
 const Player = {
   ctx: null, notes: [], dur: 0, pos: 0, playing: false,
   _master: null, _limit: null, _startCtx: 0, _startPos: 0, _next: 0, _timer: 0, _raf: 0, _osc: [],
-  _wv: {}, _wi: 0, _noise: null,
+  _wv: {}, _wi: 0, _noise: null, _drumBuffers: {},
   _ac() {
     if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)();
     return this.ctx;
@@ -400,6 +413,31 @@ const Player = {
     if (this.pos > this.dur) this.pos = 0;
     if (this.playing) { const p = this.now(); this._halt(); this.pos = p; this._begin(); }
     else transportFrame(this.pos, this.dur);
+  },
+  // {pitch: base64 WAV} — real clips of this song's own drum hits (see
+  // drumSamplesFrom / backend/transcribe.drum_hit_sample). Decoded once and
+  // cached per pitch; _drumVoice plays a decoded buffer directly instead of
+  // synthesising when one is ready. Decoding is async, so a hit can still
+  // fall back to synthesis if it's scheduled before decoding finishes —
+  // normal for clips this short, and never an error either way.
+  setDrumSamples(map) {
+    // Always starts from empty: a stale buffer under the same GM pitch from
+    // a PREVIOUS song would otherwise keep playing silently forever (the
+    // "already decoded" check below would just skip re-decoding it).
+    this._drumBuffers = {};
+    const ac = this._ac();
+    Object.entries(map || {}).forEach(([pitch, b64]) => {
+      if (!b64) return;
+      this._drumBuffers[pitch] = null;   // claim it so a second call doesn't redecode
+      try {
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        ac.decodeAudioData(bytes.buffer,
+          (buf) => { this._drumBuffers[pitch] = buf; },
+          () => { delete this._drumBuffers[pitch]; });
+      } catch (_) { delete this._drumBuffers[pitch]; }
+    });
   },
   now() {
     return this.playing
@@ -573,6 +611,19 @@ const Player = {
   _clamp(v, lo, hi, fallback) { return v == null ? fallback : Math.min(hi, Math.max(lo, v)); },
   _drumVoice(n, when, vpk) {
     const ac = this.ctx;
+    // A real clip of THIS song's own hit at this GM pitch beats any
+    // synthesised guess at one — play it directly and skip the recipe
+    // below entirely. Falls through to synthesis if none exists yet
+    // (still decoding, or none survived a clean-onset read for this pitch).
+    const sample = this._drumBuffers[String(n.pitch)];
+    if (sample) {
+      const src = ac.createBufferSource(); src.buffer = sample;
+      const g = ac.createGain(); g.gain.value = vpk;
+      src.connect(g).connect(this._master);
+      src.start(when); src.stop(when + sample.duration + 0.02);
+      this._osc.push(src);
+      return;
+    }
     const kind = this._drumKind(n.pitch);
     const cent = n.drum_centroid, dec = n.drum_decay;
     const out = ac.createGain(); out.gain.value = vpk; out.connect(this._master);

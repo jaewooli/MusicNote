@@ -65,7 +65,7 @@
 </main>
 
 <script src="vendor/vexflow.js"></script>
-<script src="musicnote-core.js?v=20260905-calib"></script>
+<script src="musicnote-core.js?v=20260905-realsample"></script>
 <script>
 Editor.on = false;
 let RESULT = null;
@@ -138,6 +138,7 @@ window.addEventListener('keydown', e => {
     // play everything (all parts) together
     const all = fsParts().flatMap(p => p.notes);
     Player.setNotes(all, RESULT.duration || 0);
+    Player.setDrumSamples(drumSamplesFrom(RESULT));
   }).catch(() => { $('#fsMsg').textContent = '불러오기 실패.'; });
 })();
 </script>

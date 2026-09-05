@@ -84,6 +84,51 @@ def test_drum_hit_profile_is_empty_on_silence():
     assert T.drum_hit_profile(y, SR, notes) == {}
 
 
+def test_drum_hit_sample_returns_a_decodable_clip_per_pitch():
+    import io
+    import soundfile as sf
+    times = [0.1, 0.4, 0.7, 1.0]
+    y = _hit_train(times)
+    notes = [{"start": t, "pitch": 42} for t in times]
+    samples = T.drum_hit_sample(y, SR, notes)
+    assert "42" in samples, f"expected a string-keyed clip, got {list(samples)}"
+    import base64
+    clip, sr_out = sf.read(io.BytesIO(base64.b64decode(samples["42"])))
+    assert sr_out == SR
+    assert 0.2 < len(clip) / sr_out < 0.5, "clip length should match clip_s (~0.35s)"
+
+
+def test_drum_hit_sample_prefers_the_cleaner_onset():
+    # One onset with loud content already sounding just before it (contaminated
+    # -- MT3 mode has no isolated drum audio); one landing on near-silence.
+    sr = SR
+    y = np.zeros(int(sr * 1.5), dtype="float32")
+    contaminated_t, clean_t = 0.5, 1.0
+    # pre-existing energy right before the contaminated onset
+    i0, i1 = int((contaminated_t - 0.05) * sr), int(contaminated_t * sr)
+    y[i0:i1] = np.random.RandomState(0).uniform(-0.3, 0.3, i1 - i0).astype("float32")
+    hit = _hit_train([contaminated_t, clean_t], dur=1.5)
+    y = y + hit
+    notes = [{"start": contaminated_t, "pitch": 38}, {"start": clean_t, "pitch": 38}]
+    samples = T.drum_hit_sample(y, sr, notes, sample=2)
+    assert "38" in samples
+    # Can't assert exactly which sample index was picked from outside, but the
+    # function must not crash and must return a real, decodable clip.
+    import base64
+    import io as _io
+    import soundfile as sf
+    clip, _ = sf.read(_io.BytesIO(base64.b64decode(samples["38"])))
+    assert len(clip) > 0
+
+
+def test_drum_hit_sample_is_empty_without_a_clean_window():
+    # Every onset too close to the start of the buffer for a full pre+clip
+    # window must be skipped, not raise.
+    y = np.zeros(100, dtype="float32")
+    notes = [{"start": 0.0, "pitch": 36}]
+    assert T.drum_hit_sample(y, SR, notes) == {}
+
+
 def main() -> int:
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

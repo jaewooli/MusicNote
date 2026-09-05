@@ -879,13 +879,16 @@ def _mt3_dynamics(raw: list[dict], wav_path: str) -> dict:
     which re-runs the gate and the voice split, stays instant.
 
     Also measures a per-part TIMBRE while the audio is already loaded:
-    ``instrument_brightness`` for a pitched part, ``drum_hit_profile`` per kit
-    piece for a drum part — both real measurements of THIS song's own audio,
-    not a fixed preset per instrument family (see FAMILY_VOICE in
-    musicnote-core.js, which is what this replaces for the parts it can measure
-    and falls back to for the ones it can't). Keyed by ``_part_key(program,
-    is_drum)`` — a string, not the natural (int, bool) tuple, because this
-    gets persisted to job JSON (json.dumps rejects tuple keys) — the same key
+    ``instrument_brightness`` for a pitched part; for a drum part, both
+    ``drum_hit_profile`` (measure, then resynthesise from the measurement)
+    and ``drum_hit_sample`` (an actual clip of this song's own cleanest hit
+    of that kit piece, preferred over the synthesised guess when one exists).
+    All real measurements of THIS song's own audio, not a fixed preset per
+    instrument family (see FAMILY_VOICE in musicnote-core.js, which is what
+    this replaces for the parts it can measure and falls back to for the ones
+    it can't). Keyed by ``_part_key(program, is_drum)`` — a string, not the
+    natural (int, bool) tuple, because this gets persisted to job JSON
+    (json.dumps rejects tuple keys) — the same key
     ``_mt3_stems`` groups notes into stems by, so the caller can cache this
     once and look it up per stem without a second pass over notes. Returns {}
     on any failure — a missing measurement means playback falls back to the
@@ -916,8 +919,9 @@ def _mt3_dynamics(raw: list[dict], wav_path: str) -> dict:
         for key, notes in by_part.items():
             if key == "drum":
                 profile = T.drum_hit_profile(y, sr, notes)
-                if profile:
-                    tone[key] = {"drum_profile": profile}
+                samples = T.drum_hit_sample(y, sr, notes)
+                if profile or samples:
+                    tone[key] = {"drum_profile": profile, "drum_samples": samples}
             else:
                 b = T.instrument_brightness(notes, sal)
                 if b is not None:
@@ -1044,6 +1048,13 @@ def _mt3_stems(job_id: str, raw: list[dict], sensitivity: float,
                 # decay_s}}. None when unmeasured (silent audio, a failed read),
                 # so the frontend's synth falls back to its fixed drum presets.
                 "drum_profile": part_tone.get("drum_profile"),
+                # {pitch: base64 WAV} — an actual clip of THIS song's own hit
+                # (transcribe.drum_hit_sample), preferred over drum_profile's
+                # measure-then-resynthesise when one exists for that pitch.
+                # Lives on the stem, not per note: every hit of one kit piece
+                # shares one clip, so tagging it per note (like brightness)
+                # would duplicate a ~20KB string onto every single hit.
+                "drum_samples": part_tone.get("drum_samples"),
                 "quantized": False, "beat_count": 0,
                 "note_count": len(notes),
                 "low_conf": sum(1 for n in notes if n["conf"] < 0.5),
